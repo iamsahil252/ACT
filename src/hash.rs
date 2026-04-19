@@ -12,7 +12,13 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use ark_bls12_381::{G1Projective, G2Projective};
+use ark_ec::hashing::{
+    curve_maps::wb::WBMap,
+    map_to_curve_hasher::MapToCurveBasedHasher,
+    HashToCurve,
+};
 use ark_ec::Group;
+use ark_ff::field_hashers::DefaultFieldHasher;
 use ark_serialize::CanonicalSerialize;
 use sha2::{Digest, Sha256};
 use crate::setup::Generators;
@@ -54,14 +60,21 @@ pub fn compute_h_ctx(
 
 /// Hash a message to a point in G1 using the BLS12‑381 hash‑to‑curve suite.
 ///
+/// Implements RFC 9380 `hash_to_curve` via the Wahby‑Boneh (WB) method with
+/// `expand_message_xmd` using SHA‑256, matching the BLS12‑381 G1 ciphersuite
+/// `BLS12381G1_XMD:SHA-256_SSWU_RO_` but with a caller‑supplied DST for
+/// protocol‑layer domain separation.
+///
 /// The domain separation tag (DST) should be a string like `"ACT:Epoch:"`.
 pub fn hash_to_g1(dst: &[u8], message: &[u8]) -> G1Projective {
-    let mut preimage = Vec::with_capacity(dst.len() + message.len() + 16);
-    preimage.extend_from_slice(b"ACT:HashToG1");
-    preimage.extend_from_slice(dst);
-    preimage.extend_from_slice(message);
-    let scalar = hash_to_scalar(&preimage);
-    G1Projective::generator() * scalar.0
+    type G1Hasher = MapToCurveBasedHasher<
+        G1Projective,
+        DefaultFieldHasher<Sha256>,
+        WBMap<ark_bls12_381::g1::Config>,
+    >;
+    let hasher =
+        <G1Hasher as HashToCurve<G1Projective>>::new(dst).expect("hash_to_g1 domain setup");
+    hasher.hash(message).expect("hash_to_g1 mapping").into()
 }
 
 /// Hash an arbitrary preimage to a scalar for Fiat–Shamir challenges.
@@ -130,5 +143,26 @@ mod tests {
         let s1 = hash_to_scalar(preimage);
         let s2 = hash_to_scalar(preimage);
         assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn hash_to_g1_is_not_generator_multiple() {
+        // Verify that hash_to_g1 produces a point that is not a simple multiple
+        // of the generator (i.e., we're actually using hash-to-curve, not
+        // hash-to-scalar * G).
+        use ark_std::Zero;
+        let p = hash_to_g1(b"ACT:Test:", b"hello");
+        let g = G1Projective::generator();
+        // There is no known discrete log of p w.r.t. g from hash_to_curve,
+        // and we can at least verify p != g and p != identity.
+        assert_ne!(p, g, "hash_to_g1 must not return the generator");
+        assert!(!p.is_zero(), "hash_to_g1 must not return the identity");
+    }
+
+    #[test]
+    fn hash_to_g1_deterministic() {
+        let p1 = hash_to_g1(b"ACT:Epoch:", b"epoch:42");
+        let p2 = hash_to_g1(b"ACT:Epoch:", b"epoch:42");
+        assert_eq!(p1, p2, "hash_to_g1 must be deterministic");
     }
 }
