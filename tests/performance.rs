@@ -228,8 +228,7 @@ fn performance_profile() {
 
     let (_daily_sig_base, k_daily) = last_daily.unwrap();
     let spend_amount = 30u32;
-    let mut nonce = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    let nonce: [u8; 16] = rand::random();
 
     let (mut st_sp, mut st_sv) = (Stats::new(), Stats::new());
     let mut last_sp: Option<act::spend::SpendProof> = None;
