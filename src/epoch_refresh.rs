@@ -18,12 +18,19 @@ use ark_serialize::CanonicalSerialize;
 use ark_std::rand::RngCore;
 use ark_std::Zero;
 use crate::bbs_proof::{BbsProof, BbsProofContext, BbsSignature};
-use crate::bulletproofs::{prove_range, verify_range, RangeProof};
+use crate::bulletproofs::{prove_range, serialize_proof, verify_range, RangeProof};
 use crate::commitments::{commit, verify_bridge, verify_bridge_single_base};
 use crate::error::{ActError, Result};
 use crate::hash::{hash_to_g1, hash_to_scalar};
 use crate::setup::{Generators, ServerKeys};
 use crate::types::Scalar;
+
+fn msm_projective(bases: &[G1Projective], scalars: &[ark_bls12_381::Fr]) -> G1Projective {
+    bases
+        .iter()
+        .zip(scalars.iter())
+        .fold(G1Projective::zero(), |acc, (b, s)| acc + (*b * *s))
+}
 
 // ============================================================================
 // Refresh Proof Structure
@@ -199,9 +206,9 @@ impl RefreshProver {
                 Scalar::from(c_max).0,
                 Scalar::from(e_max).0,
             ];
-            G1Projective::msm(&bases, &scalars).unwrap()
+            msm_projective(&bases, &scalars)
         };
-        let a_bar = a_prime.mul(-master.e.0) + msg_part * r1.0;
+        let a_bar = a_prime * (-master.e.0) + msg_part * r1.0;
 
         let s_tilde = master.s * r1;
         let k_tilde = k_sub * r1;
@@ -292,7 +299,7 @@ impl RefreshProver {
         n_t.serialize_compressed(&mut preimage).unwrap();
         k_daily_commit.serialize_compressed(&mut preimage).unwrap();
         c_delta.serialize_compressed(&mut preimage).unwrap();
-        bp_exp.serialize_compressed(&mut preimage).unwrap();
+        preimage.extend_from_slice(&serialize_proof(&bp_exp).unwrap());
         a_prime.serialize_compressed(&mut preimage).unwrap();
         a_bar.serialize_compressed(&mut preimage).unwrap();
         t_bbs.serialize_compressed(&mut preimage).unwrap();
@@ -388,7 +395,7 @@ pub fn verify_refresh(
     proof.n_t.serialize_compressed(&mut preimage).unwrap();
     proof.k_daily.serialize_compressed(&mut preimage).unwrap();
     proof.c_delta.serialize_compressed(&mut preimage).unwrap();
-    proof.bp_exp.serialize_compressed(&mut preimage).unwrap();
+    preimage.extend_from_slice(&serialize_proof(&proof.bp_exp).unwrap());
     proof.a_prime.serialize_compressed(&mut preimage).unwrap();
     proof.a_bar.serialize_compressed(&mut preimage).unwrap();
     proof.t_bbs.serialize_compressed(&mut preimage).unwrap();
@@ -502,7 +509,7 @@ pub fn verify_refresh(
             Scalar::ONE.0,
             s_prime_daily.0,
         ];
-        let msg_part = G1Projective::msm(&bases, &scalars).unwrap();
+        let msg_part = msm_projective(&bases, &scalars);
         let denom = e_daily + keys.sk_daily;
         let denom_inv = denom.0.inverse().unwrap();
         msg_part * denom_inv
@@ -554,7 +561,7 @@ mod tests {
             Scalar::from(c_max).0,
             Scalar::from(e_max).0,
         ];
-        let msg_part = G1Projective::msm(&bases, &scalars).unwrap();
+        let msg_part = msm_projective(&bases, &scalars);
         let denom = e_sub + keys.sk_master;
         let a_sub = msg_part * denom.0.inverse().unwrap();
         let s_sub = r_sub + s_prime_sub;

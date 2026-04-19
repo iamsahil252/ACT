@@ -16,17 +16,24 @@ use alloc::vec::Vec;
 use ark_std::vec;
 use ark_bls12_381::{G1Projective, G2Projective};
 use ark_ec::{CurveGroup, VariableBaseMSM, pairing::Pairing};
-use ark_ff::{Field, PrimeField};
+use ark_ff::{BigInteger, Field, PrimeField};
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::RngCore;
 use ark_std::Zero;
 use crate::bbs_proof::{BbsProof, BbsProofContext, BbsSignature};
-use crate::bulletproofs::{prove_range, verify_range, RangeProof};
+use crate::bulletproofs::{prove_range, serialize_proof, verify_range, RangeProof};
 use crate::commitments::{verify_bridge, verify_bridge_single_base};
 use crate::error::{ActError, Result};
 use crate::hash::{hash_to_scalar};
 use crate::setup::{Generators, ServerKeys};
 use crate::types::Scalar;
+
+fn msm_projective(bases: &[G1Projective], scalars: &[ark_bls12_381::Fr]) -> G1Projective {
+    bases
+        .iter()
+        .zip(scalars.iter())
+        .fold(G1Projective::zero(), |acc, (b, s)| acc + (*b * *s))
+}
 
 // ============================================================================
 // Spend Proof Structure
@@ -176,7 +183,7 @@ impl SpendProver {
                 k_cur.0,
                 Scalar::from(t_issue).0,
             ];
-            G1Projective::msm(&bases, &scalars).unwrap()
+            msm_projective(&bases, &scalars)
         };
         let a_bar = a_prime * (-token.e.0) + msg_part * r1.0;
 
@@ -277,7 +284,7 @@ impl SpendProver {
         k_prime.serialize_compressed(&mut preimage).unwrap();
         c_total.serialize_compressed(&mut preimage).unwrap();
         c_bp.serialize_compressed(&mut preimage).unwrap();
-        bp_spend.serialize_compressed(&mut preimage).unwrap();
+        preimage.extend_from_slice(&serialize_proof(&bp_spend).unwrap());
         a_prime.serialize_compressed(&mut preimage).unwrap();
         a_bar.serialize_compressed(&mut preimage).unwrap();
         t_bbs.serialize_compressed(&mut preimage).unwrap();
@@ -382,7 +389,7 @@ pub fn verify_spend(
     proof.k_prime.serialize_compressed(&mut preimage).unwrap();
     c_total.serialize_compressed(&mut preimage).unwrap();
     proof.c_bp.serialize_compressed(&mut preimage).unwrap();
-    proof.bp_spend.serialize_compressed(&mut preimage).unwrap();
+    preimage.extend_from_slice(&serialize_proof(&proof.bp_spend).unwrap());
     proof.a_prime.serialize_compressed(&mut preimage).unwrap();
     proof.a_bar.serialize_compressed(&mut preimage).unwrap();
     proof.t_bbs.serialize_compressed(&mut preimage).unwrap();
@@ -498,7 +505,7 @@ pub fn verify_spend(
             Scalar::ONE.0,
             s_prime_refund.0,
         ];
-        let msg_part = G1Projective::msm(&bases, &scalars).unwrap();
+        let msg_part = msm_projective(&bases, &scalars);
         let denom = e_refund + keys.sk_daily;
         let denom_inv = denom.0.inverse().unwrap();
         msg_part * denom_inv

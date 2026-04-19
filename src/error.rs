@@ -40,3 +40,11 @@ impl From<ark_std::io::Error> for ActError {
         Self::IoError(value)
     }
 }
+
+#[cfg(feature = "server")]
+impl From<redis::RedisError> for ActError {
+    fn from(value: redis::RedisError) -> Self {
+        Self::DatabaseError(value.to_string())
+    }
+}
+

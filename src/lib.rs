@@ -120,8 +120,8 @@ mod tests {
         let (a_sub, e_sub, s_prime) = MasterMintServer::issue(
             &mut rng, &mint_req, 100, 5000, &generators, &keys, h_ctx
         ).unwrap();
-        let master_sig = mint_client.finalize(a_sub, e_sub, s_prime);
         let k_sub = mint_client.k_sub;
+        let master_sig = mint_client.finalize(a_sub, e_sub, s_prime);
 
         // 2. Epoch Refresh
         let current_epoch = 1000u32;
