@@ -7,6 +7,7 @@
 //! `c_max` and `e_max` (both 32‑bit unsigned integers).
 
 extern crate alloc;
+use alloc::format;
 use alloc::vec::Vec;
 use ark_std::vec;
 use ark_bls12_381::G1Projective;

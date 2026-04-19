@@ -11,13 +11,14 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use ark_std::vec;
-use ark_bls12_381::{Fr, G1Projective, G2Projective};
-use ark_ec::CurveGroup;
+use ark_bls12_381::{G1Projective, G2Projective};
+use ark_ec::{CurveGroup, VariableBaseMSM, pairing::Pairing};
+use ark_ff::{Field, PrimeField};
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::RngCore;
-use ark_bulletproofs::RangeProof;
+use ark_std::Zero;
 use crate::bbs_proof::{BbsProof, BbsProofContext, BbsSignature};
-use crate::bulletproofs::{prove_range, verify_range};
+use crate::bulletproofs::{prove_range, verify_range, RangeProof};
 use crate::commitments::{commit, verify_bridge, verify_bridge_single_base};
 use crate::error::{ActError, Result};
 use crate::hash::{hash_to_g1, hash_to_scalar};
@@ -56,7 +57,7 @@ pub struct RefreshProof {
     pub z_w: Scalar,
 
     // Range proof for expiry
-    pub bp_exp: RangeProof<Fr>,
+    pub bp_exp: RangeProof,
 
     // Public values (sent separately but included here for convenience)
     pub n_t: G1Projective,
