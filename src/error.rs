@@ -48,4 +48,3 @@ impl From<redis::RedisError> for ActError {
     }
 }
 
-

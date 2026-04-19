@@ -91,7 +91,7 @@ impl NullifierManager {
         let key = format!("act:epoch:{}:nullifiers", self.config.current_epoch);
         let added: u64 = conn.sadd(&key, n_t.0.as_slice()).await?;
         let ttl = self.config.epoch_grace_period_secs + 86400;
-        let _: () = conn.expire(&key, ttl as usize).await?;
+        let _: () = conn.expire(&key, ttl as i64).await?;
         Ok(added == 1)
     }
 
@@ -107,7 +107,7 @@ impl NullifierManager {
         let key = format!("act:spend:{}:nullifiers", epoch_key);
         let added: u64 = conn.sadd(&key, k_cur.to_bytes().as_slice()).await?;
         let ttl = self.config.epoch_grace_period_secs + 86400;
-        let _: () = conn.expire(&key, ttl as usize).await?;
+        let _: () = conn.expire(&key, ttl as i64).await?;
         Ok(added == 1)
     }
 }
