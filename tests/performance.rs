@@ -80,11 +80,9 @@ fn refresh_proof_size(proof: &RefreshProof) -> usize {
 
 fn spend_proof_size(proof: &act::spend::SpendProof) -> usize {
     // BBS+ core (3×G1) + bridge commits (6×G1) + public values (2×G1) +
-    // disclosed u32×2 (8 bytes) + k_cur Fr + 7×Fr responses + Bulletproof.
-    let bp = act::bulletproofs::serialize_proof(&proof.bp_spend)
-        .map(|b| b.len())
-        .unwrap_or(0);
-    11 * G1_BYTES + 8 * SCALAR_BYTES + 8 + bp
+    // disclosed u32×2 (8 bytes) + k_cur Fr + 7×Fr responses + BatchedEqualityProof.
+    let beq = proof.batched_eq.to_bytes().len();
+    11 * G1_BYTES + 8 * SCALAR_BYTES + 8 + beq
 }
 
 // ─── test fixtures ───────────────────────────────────────────────────────────
@@ -255,7 +253,7 @@ fn performance_profile() {
     st_sv.print("Server verify (challenge + bridges + MSM + BP + pairing):");
 
     let sp = last_sp.as_ref().unwrap();
-    let sp_bp = act::bulletproofs::serialize_proof(&sp.bp_spend).unwrap();
+    let sp_beq = sp.batched_eq.to_bytes().len();
     let sp_total = spend_proof_size(sp);
 
     println!();
@@ -267,7 +265,7 @@ fn performance_profile() {
     println!("    Disclosed (s u32 + T_issue u32)    : 8 bytes");
     println!("    k_cur (disclosed nullifier)  1×Fr  : {} bytes", SCALAR_BYTES);
     println!("    Schnorr responses            7×Fr  : {} bytes", 7 * SCALAR_BYTES);
-    println!("    Bulletproof  (32-bit range)        : {} bytes", sp_bp.len());
+    println!("    BatchedEquality (BEQ bridge+BP)    : {} bytes", sp_beq);
     println!();
 
     // ── 5. Component Benchmarks ───────────────────────────────────────────────
