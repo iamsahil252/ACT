@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use ark_std::vec;
 use ark_bls12_381::{Fr, G1Projective, G2Projective};
 use ark_ec::{pairing::Pairing, CurveGroup, VariableBaseMSM};
-use ark_ff::{Field, PrimeField, Zero};
+use ark_ff::Zero;
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::RngCore;
 use crate::error::{ActError, Result};
@@ -331,6 +331,7 @@ impl BbsProof {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ark_ff::Field;
     use ark_std::rand::thread_rng;
     use crate::hash::compute_h_ctx;
     use crate::setup::{Generators, ServerKeys};

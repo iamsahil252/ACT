@@ -12,7 +12,6 @@
 use ark_std::io::{Read, Write};
 
 use ark_bls12_381::{Fr, G1Affine, G2Affine, G1Projective, G2Projective};
-use ark_ec::{AffineRepr, CurveGroup, Group};
 use ark_ff::{Field, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, SerializationError, Validate, Valid};
 use ark_std::rand::{
@@ -236,6 +235,74 @@ impl CanonicalDeserialize for Scalar {
     }
 }
 
+// ---- Serde serialization for Scalar ----------------------------------------
+
+impl Serialize for Scalar {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        self.to_bytes().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Scalar {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        let bytes = <[u8; 32]>::deserialize(deserializer)?;
+        Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+// ============================================================================
+// G1Projective serde module
+// ============================================================================
+
+/// Serde module for serializing/deserializing `G1Projective` as a compressed
+/// 48-byte array. Use with `#[serde(with = "crate::types::g1_serde")]`.
+pub mod g1_serde {
+    use ark_bls12_381::{G1Affine, G1Projective};
+    use ark_ec::CurveGroup;
+    use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+    use serde::{Deserializer, Serializer, de::SeqAccess};
+
+    pub fn serialize<S: Serializer>(p: &G1Projective, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut bytes = [0u8; 48];
+        p.into_affine()
+            .serialize_compressed(&mut bytes[..])
+            .map_err(serde::ser::Error::custom)?;
+        let mut tup = serializer.serialize_tuple(48)?;
+        for b in &bytes {
+            tup.serialize_element(b)?;
+        }
+        tup.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<G1Projective, D::Error> {
+        struct Bytes48Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Bytes48Visitor {
+            type Value = [u8; 48];
+
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.write_str("48-byte compressed G1 point")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<[u8; 48], A::Error> {
+                let mut bytes = [0u8; 48];
+                for b in bytes.iter_mut() {
+                    *b = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::custom("too few bytes for G1 point"))?;
+                }
+                Ok(bytes)
+            }
+        }
+
+        let bytes = deserializer.deserialize_tuple(48, Bytes48Visitor)?;
+        let affine = G1Affine::deserialize_compressed(&bytes[..])
+            .map_err(serde::de::Error::custom)?;
+        Ok(affine.into())
+    }
+}
+
 // ============================================================================
 // Compressed Group Elements
 // ============================================================================
@@ -387,6 +454,7 @@ impl TryFrom<HexG2> for CompressedG2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ark_ec::{CurveGroup, Group};
     use ark_std::rand::thread_rng;
 
     #[test]

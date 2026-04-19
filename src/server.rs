@@ -21,13 +21,9 @@ use crate::types::{CompressedG1, Scalar};
 #[cfg(feature = "server")]
 use sha2::{Digest, Sha256};
 #[cfg(feature = "server")]
-use std::collections::HashSet;
-#[cfg(feature = "server")]
 use std::sync::Arc;
 #[cfg(feature = "server")]
 use tokio::sync::RwLock;
-#[cfg(feature = "server")]
-use ark_serialize::CanonicalSerialize;
 #[cfg(feature = "server")]
 use rand::RngCore;
 
@@ -476,14 +472,7 @@ pub mod handlers {
     use crate::hash::compute_h_ctx;
     use ark_ec::CurveGroup;
     use ark_std::rand::thread_rng;
-    use ark_serialize::CanonicalSerialize;
-    use serde::{Serialize, Deserialize};
     use bincode;
-
-    // Add serialization derives to response types (they must be defined with serde)
-    // Note: These derives are added here for completeness. In practice they should be
-    // added to the struct definitions in epoch_refresh.rs and spend.rs.
-    // We include them here as a reminder; the actual structs must have #[derive(Serialize, Deserialize)].
 
     pub struct AppState {
         pub generators: Generators,

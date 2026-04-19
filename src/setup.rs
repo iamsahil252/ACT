@@ -5,9 +5,6 @@
 //! generated with distinct signing keys for Master and Daily tokens as required
 //! by the specification.
 
-extern crate alloc;
-use alloc::vec::Vec;
-use ark_std::vec;
 use ark_bls12_381::{G1Projective, G2Projective};
 use ark_ec::Group;
 use ark_std::rand::RngCore;
