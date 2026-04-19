@@ -573,9 +573,10 @@ pub fn verify_refresh(
     // 7. Pairing check: e(A', pk_master) == e(A_bar, g2).
     // Combined into a single multi-pairing (one shared Miller loop + one final
     // exponentiation) rather than two separate pairings.
+    // Uses precomputed G2Prepared line functions to skip per-call preparation.
     let pairing_check = ark_bls12_381::Bls12_381::multi_pairing(
         [proof.a_prime.into_affine(), (-proof.a_bar).into_affine()],
-        [(*pk_master).into_affine(), generators.g2.into_affine()],
+        [keys.pk_master_prepared.clone(), generators.g2_prepared.clone()],
     );
     if pairing_check.0 != Fq12::ONE {
         return Err(ActError::VerificationFailed("Pairing check failed".into()));

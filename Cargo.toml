@@ -28,7 +28,6 @@ merlin = { version = "3", default-features = false }
 bulletproofs = { version = "4.0.0", default-features = false, features = ["std"] }
 # Must match the exact fork bulletproofs 4.0.0 uses internally
 curve25519-dalek-ng = { version = "4", default-features = false, features = ["alloc", "u64_backend"] }
-num-bigint = { version = "0.4", default-features = false, features = ["std"] }
 
 # Hashing – enable hardware SHA-256 intrinsics where available
 sha2 = { version = "0.10", default-features = false, features = ["asm"] }

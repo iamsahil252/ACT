@@ -18,7 +18,6 @@ dependencies = [
  "curve25519-dalek-ng",
  "hex",
  "merlin",
- "num-bigint",
  "rand",
  "rand_core",
  "redis",

@@ -6,12 +6,16 @@
 //! by the specification.
 
 use ark_bls12_381::{G1Affine, G1Projective, G2Projective};
-use ark_ec::{CurveGroup, Group};
+use ark_ec::{bls12::G2Prepared, CurveGroup, Group};
 use ark_std::rand::RngCore;
 use ark_std::Zero;
 use std::sync::OnceLock;
 use crate::hash::hash_to_g1;
 use crate::types::Scalar;
+
+/// Type alias for the cached G2 pairing line functions used by BLS12-381.
+/// Equivalent to `<Bls12_381 as Pairing>::G2Prepared`.
+type G2Prep = G2Prepared<ark_bls12_381::Config>;
 
 /// BBS+ generators: `g1 ∈ G1`, `g2 ∈ G2`, and `h_0, h_1, h_2, h_3, h_4 ∈ G1`.
 ///
@@ -21,6 +25,8 @@ use crate::types::Scalar;
 /// **Performance:** affine forms (`g1_affine`, `h_affine`) are precomputed via
 /// a single batch field inversion at initialization and cached in the global
 /// singleton so that MSM callers never pay for projective→affine conversions.
+/// `g2_prepared` caches the G2 pairing line functions for g2, eliminating their
+/// recomputation on every `multi_pairing` call.
 #[derive(Clone, Debug)]
 pub struct Generators {
     pub g1: G1Projective,
@@ -32,6 +38,10 @@ pub struct Generators {
     /// Precomputed affine forms of `h[0..5]`, computed via a single batch
     /// field inversion at initialization time.
     pub h_affine: [G1Affine; 5],
+    /// Precomputed G2Prepared form of `g2` (pairing line functions).
+    /// Caching this avoids recomputing the line functions on every
+    /// `multi_pairing` call in the server verifiers.
+    pub g2_prepared: G2Prep,
 }
 
 /// Process-wide singleton for the deterministic BBS+ generators.
@@ -77,7 +87,12 @@ impl Generators {
         // g1 is the standard generator (z-coordinate = 1), so into_affine is free.
         let g1_affine = g1.into_affine();
 
-        Self { g1, g2, h, g1_affine, h_affine }
+        // Precompute the G2Prepared pairing line functions for g2.  These are
+        // completely static and would otherwise be recomputed on every pairing
+        // call inside the server verifiers.
+        let g2_prepared = G2Prep::from(g2.into_affine());
+
+        Self { g1, g2, h, g1_affine, h_affine, g2_prepared }
     }
 }
 
@@ -98,6 +113,12 @@ pub struct ServerKeys {
     pub sk_daily: Scalar,
     /// Daily token public key (G2 point).
     pub pk_daily: G2Projective,
+    /// Precomputed G2Prepared form of `pk_master` (pairing line functions).
+    /// Cached once at key-generation time to avoid recomputing on every verify.
+    pub pk_master_prepared: G2Prep,
+    /// Precomputed G2Prepared form of `pk_daily` (pairing line functions).
+    /// Cached once at key-generation time to avoid recomputing on every verify.
+    pub pk_daily_prepared: G2Prep,
 }
 
 impl ServerKeys {
@@ -111,11 +132,16 @@ impl ServerKeys {
         let pk_master = G2Projective::generator() * sk_master.0;
         let sk_daily = Scalar::rand_nonzero(rng);
         let pk_daily = G2Projective::generator() * sk_daily.0;
+        // Precompute G2Prepared forms so every verification call can reuse them.
+        let pk_master_prepared = G2Prep::from(pk_master.into_affine());
+        let pk_daily_prepared  = G2Prep::from(pk_daily.into_affine());
         Self {
             sk_master,
             pk_master,
             sk_daily,
             pk_daily,
+            pk_master_prepared,
+            pk_daily_prepared,
         }
     }
 }
