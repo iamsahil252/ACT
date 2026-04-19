@@ -1,27 +1,49 @@
 extern crate alloc;
-use alloc::vec::Vec;
-use ark_std::vec;
 use alloc::string::String;
-use thiserror::Error;
+use core::fmt;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum ActError {
-    #[error("Invalid scalar: not in field")]
     InvalidScalar,
-    #[error("Invalid group element: not in subgroup")]
     InvalidSubgroup,
-    #[error("Proof verification failed: {0}")]
     VerificationFailed(String),
-    #[error("Serialization error: {0}")]
-    SerializationError(#[from] ark_serialize::SerializationError),
-    #[error("I/O error: {0}")]
-    IoError(#[from] ark_std::io::Error),
-    #[error("Bulletproofs error: {0}")]
-    BulletproofsError(#[from] ark_bulletproofs::ProofError),
-    #[error("Protocol error: {0}")]
+    SerializationError(ark_serialize::SerializationError),
+    IoError(ark_std::io::Error),
     ProtocolError(String),
-    #[error("Database error: {0}")]
     DatabaseError(String),
 }
 
 pub type Result<T> = core::result::Result<T, ActError>;
+
+impl fmt::Display for ActError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidScalar => write!(f, "Invalid scalar: not in field"),
+            Self::InvalidSubgroup => write!(f, "Invalid group element: not in subgroup"),
+            Self::VerificationFailed(msg) => write!(f, "Proof verification failed: {msg}"),
+            Self::SerializationError(err) => write!(f, "Serialization error: {err}"),
+            Self::IoError(err) => write!(f, "I/O error: {err}"),
+            Self::ProtocolError(msg) => write!(f, "Protocol error: {msg}"),
+            Self::DatabaseError(msg) => write!(f, "Database error: {msg}"),
+        }
+    }
+}
+
+impl From<ark_serialize::SerializationError> for ActError {
+    fn from(value: ark_serialize::SerializationError) -> Self {
+        Self::SerializationError(value)
+    }
+}
+
+impl From<ark_std::io::Error> for ActError {
+    fn from(value: ark_std::io::Error) -> Self {
+        Self::IoError(value)
+    }
+}
+
+#[cfg(feature = "server")]
+impl From<redis::RedisError> for ActError {
+    fn from(value: redis::RedisError) -> Self {
+        Self::DatabaseError(value.to_string())
+    }
+}
