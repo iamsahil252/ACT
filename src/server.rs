@@ -23,6 +23,8 @@ use sha2::{Digest, Sha256};
 #[cfg(feature = "server")]
 use std::sync::Arc;
 #[cfg(feature = "server")]
+use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(feature = "server")]
 use tokio::sync::RwLock;
 #[cfg(feature = "server")]
 use rand::RngCore;
@@ -279,9 +281,17 @@ impl MerkleTree {
 // Bloom Filter for High‑Privacy Nonce Reuse Detection
 // ============================================================================
 
+/// A lock-free Bloom filter backed by an array of `AtomicU8`.
+///
+/// Each bit is set using `fetch_or` with `Relaxed` ordering.  Because the
+/// filter is used only as a *fast-path pre-check* in front of an authoritative
+/// Redis SADD, the tiny TOCTOU window between `contains` and `insert` in
+/// concurrent code is acceptable: false negatives are impossible (bits are
+/// never cleared), and a false positive at most causes the client to be asked
+/// to retry with a fresh nonce, which is explicitly permitted by the spec.
 #[cfg(feature = "server")]
 pub struct BloomFilter {
-    bits: Vec<u8>,
+    bits: Vec<AtomicU8>,
     num_hashes: usize,
 }
 
@@ -290,8 +300,13 @@ impl BloomFilter {
     pub fn new(capacity: usize, fp_rate: f64) -> Self {
         let m = (-(capacity as f64) * fp_rate.ln() / (2.0f64.ln().powi(2))).ceil() as usize;
         let k = ((m as f64 / capacity as f64) * 2.0f64.ln()).ceil() as usize;
+        let byte_count = (m + 7) / 8;
+        let mut bits = Vec::with_capacity(byte_count);
+        for _ in 0..byte_count {
+            bits.push(AtomicU8::new(0));
+        }
         Self {
-            bits: vec![0u8; (m + 7) / 8],
+            bits,
             num_hashes: k.max(1),
         }
     }
@@ -305,12 +320,14 @@ impl BloomFilter {
         (hasher.finish() as usize) % (self.bits.len() * 8)
     }
 
-    pub fn insert(&mut self, item: &[u8]) {
+    /// Insert `item` into the filter.  Takes `&self` (not `&mut self`) so
+    /// concurrent inserts are possible without holding any lock.
+    pub fn insert(&self, item: &[u8]) {
         for i in 0..self.num_hashes {
             let bit = self.hash(item, i as u64);
             let byte = bit / 8;
-            let mask = 1 << (bit % 8);
-            self.bits[byte] |= mask;
+            let mask = 1u8 << (bit % 8);
+            self.bits[byte].fetch_or(mask, Ordering::Relaxed);
         }
     }
 
@@ -318,8 +335,8 @@ impl BloomFilter {
         for i in 0..self.num_hashes {
             let bit = self.hash(item, i as u64);
             let byte = bit / 8;
-            let mask = 1 << (bit % 8);
-            if self.bits[byte] & mask == 0 {
+            let mask = 1u8 << (bit % 8);
+            if self.bits[byte].load(Ordering::Relaxed) & mask == 0 {
                 return false;
             }
         }
@@ -337,13 +354,15 @@ pub struct NonceManager {
     client: Client,
     ttl_secs: u64,
     inner: Arc<RwLock<NonceManagerInner>>,
+    /// The Bloom filter lives outside the `RwLock` so that concurrent
+    /// `insert` calls (which only need `&self`) do not block one another.
+    bloom_filter: Arc<BloomFilter>,
 }
 
 #[cfg(feature = "server")]
 struct NonceManagerInner {
     current_root: Option<[u8; 32]>,
     current_tree: Option<MerkleTree>,
-    bloom_filter: BloomFilter,
 }
 
 #[cfg(feature = "server")]
@@ -355,11 +374,11 @@ impl NonceManager {
             inner: Arc::new(RwLock::new(NonceManagerInner {
                 current_root: None,
                 current_tree: None,
-                bloom_filter: BloomFilter::new(
-                    config.high_privacy_batch_size,
-                    config.bloom_filter_fp_rate,
-                ),
             })),
+            bloom_filter: Arc::new(BloomFilter::new(
+                config.high_privacy_batch_size,
+                config.bloom_filter_fp_rate,
+            )),
         }
     }
 
@@ -425,6 +444,7 @@ impl NonceManager {
         merkle_proof: &MerkleProof,
         expected_root: &[u8; 32],
     ) -> Result<bool> {
+        // Proof and leaf check require only a read lock on the tree.
         let inner = self.inner.read().await;
 
         if !merkle_proof.verify(expected_root) {
@@ -435,13 +455,19 @@ impl NonceManager {
             return Ok(false);
         }
 
-        if inner.bloom_filter.contains(nonce) {
+        // Fast-path: if the bloom filter already contains this nonce, reject.
+        // The filter is lock-free so no lock needed here.
+        if self.bloom_filter.contains(nonce) {
             return Ok(false);
         }
 
         drop(inner);
-        let mut inner = self.inner.write().await;
-        inner.bloom_filter.insert(nonce);
+
+        // Insert the nonce atomically.  There is a tiny TOCTOU window between
+        // `contains` and `insert`, but any duplicate that slips through will be
+        // caught by the downstream Redis spend-nullifier SADD, which is the
+        // authoritative double-spend guard.
+        self.bloom_filter.insert(nonce);
 
         Ok(true)
     }
@@ -543,17 +569,20 @@ pub mod handlers {
             return Err(ActError::VerificationFailed("Epoch nullifier already used".into()));
         }
 
-        // 3. Verify the proof
-        let mut rng = thread_rng();
-        let response = verify_refresh(
-            &proof,
-            state.config.current_epoch,
-            &state.generators,
-            &state.keys.pk_master,
-            &state.keys,
-            state.h_ctx,
-            &mut rng,
-        )?;
+        // 3. Verify the proof on a blocking thread so the async reactor is not
+        //    stalled by several milliseconds of CPU-bound cryptographic work.
+        let generators = state.generators.clone();
+        let pk_master = state.keys.pk_master;
+        let keys = state.keys.clone();
+        let h_ctx = state.h_ctx;
+        let current_epoch = state.config.current_epoch;
+        let response = tokio::task::spawn_blocking(move || {
+            let mut rng = rand::thread_rng();
+            verify_refresh(&proof, current_epoch, &generators, &pk_master, &keys, h_ctx, &mut rng)
+        })
+        .await
+        .map_err(|e| ActError::ProtocolError(format!("Blocking task panicked: {e}")))?
+        ?;
 
         // 4. Cache the response for idempotency
         let response_bytes = bincode::serialize(&response)
@@ -585,8 +614,9 @@ pub mod handlers {
         }
 
         // 3. Verify nonce freshness
-        if let (Some(proof), Some(root)) = (merkle_proof, merkle_root) {
-            if !state.nonce_mgr.verify_merkle_nonce(nonce, &proof, &root).await? {
+        let nonce_copy = *nonce;
+        if let (Some(mproof), Some(root)) = (merkle_proof, merkle_root) {
+            if !state.nonce_mgr.verify_merkle_nonce(nonce, &mproof, &root).await? {
                 return Err(ActError::VerificationFailed("Invalid or reused nonce".into()));
             }
         } else {
@@ -600,18 +630,20 @@ pub mod handlers {
             return Err(ActError::VerificationFailed("Spend nullifier already used".into()));
         }
 
-        // 5. Verify the proof
-        let mut rng = thread_rng();
-        let response = verify_spend(
-            &proof,
-            state.config.current_epoch,
-            nonce,
-            &state.generators,
-            &state.keys.pk_daily,
-            &state.keys,
-            state.h_ctx,
-            &mut rng,
-        )?;
+        // 5. Verify the proof on a blocking thread so the async reactor is not
+        //    stalled by several milliseconds of CPU-bound cryptographic work.
+        let generators = state.generators.clone();
+        let pk_daily = state.keys.pk_daily;
+        let keys = state.keys.clone();
+        let h_ctx = state.h_ctx;
+        let current_epoch = state.config.current_epoch;
+        let response = tokio::task::spawn_blocking(move || {
+            let mut rng = rand::thread_rng();
+            verify_spend(&proof, current_epoch, &nonce_copy, &generators, &pk_daily, &keys, h_ctx, &mut rng)
+        })
+        .await
+        .map_err(|e| ActError::ProtocolError(format!("Blocking task panicked: {e}")))?
+        ?;
 
         // 6. Cache the response for idempotency
         let response_bytes = bincode::serialize(&response)

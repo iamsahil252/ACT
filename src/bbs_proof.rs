@@ -17,9 +17,9 @@ extern crate alloc;
 use alloc::format;
 use alloc::vec::Vec;
 use ark_std::vec;
-use ark_bls12_381::{Fr, G1Projective, G2Projective};
+use ark_bls12_381::{Fq12, Fr, G1Projective, G2Projective};
 use ark_ec::{pairing::Pairing, CurveGroup, VariableBaseMSM};
-use ark_ff::Zero;
+use ark_ff::{Field, Zero};
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::RngCore;
 use crate::error::{ActError, Result};
@@ -27,11 +27,13 @@ use crate::hash::hash_to_scalar;
 use crate::setup::Generators;
 use crate::types::Scalar;
 
+/// Efficient MSM using batch affine normalization + Pippenger's algorithm.
+///
+/// Converts projective bases to affine with a single batch inversion, then
+/// delegates to `VariableBaseMSM` (Pippenger) rather than the naïve fold.
 fn msm_projective(bases: &[G1Projective], scalars: &[Fr]) -> G1Projective {
-    bases
-        .iter()
-        .zip(scalars.iter())
-        .fold(G1Projective::zero(), |acc, (b, s)| acc + (*b * *s))
+    let affine = G1Projective::normalize_batch(bases);
+    G1Projective::msm(&affine, scalars).expect("MSM length mismatch")
 }
 
 /// A BBS+ signature.
@@ -252,9 +254,14 @@ impl BbsProof {
         );
 
         // ---------- Pairing check: e(A', pk) == e(A_bar, g2) ----------
-        let pairing_left = ark_bls12_381::Bls12_381::pairing(self.a_prime, *pk);
-        let pairing_right = ark_bls12_381::Bls12_381::pairing(self.a_bar, generators.g2);
-        if pairing_left.0 != pairing_right.0 {
+        // Rewritten as a single multi-pairing: e(A', pk) * e(-A_bar, g2) == 1.
+        // One shared Miller loop + one final exponentiation instead of two
+        // separate pairings, cutting pairing cost roughly in half.
+        let pairing_check = ark_bls12_381::Bls12_381::multi_pairing(
+            [self.a_prime.into_affine(), (-self.a_bar).into_affine()],
+            [(*pk).into_affine(), generators.g2.into_affine()],
+        );
+        if pairing_check.0 != Fq12::ONE {
             return Err(ActError::VerificationFailed(
                 "Pairing check failed".into(),
             ));

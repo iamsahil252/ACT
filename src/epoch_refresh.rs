@@ -11,7 +11,7 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use ark_std::vec;
-use ark_bls12_381::{G1Projective, G2Projective};
+use ark_bls12_381::{Fq12, G1Projective, G2Projective};
 use ark_ec::{CurveGroup, VariableBaseMSM, pairing::Pairing};
 use ark_ff::Field;
 use ark_serialize::CanonicalSerialize;
@@ -25,11 +25,10 @@ use crate::hash::{hash_to_g1, hash_to_scalar};
 use crate::setup::{Generators, ServerKeys};
 use crate::types::Scalar;
 
+/// Efficient MSM using batch affine normalization + Pippenger's algorithm.
 fn msm_projective(bases: &[G1Projective], scalars: &[ark_bls12_381::Fr]) -> G1Projective {
-    bases
-        .iter()
-        .zip(scalars.iter())
-        .fold(G1Projective::zero(), |acc, (b, s)| acc + (*b * *s))
+    let affine = G1Projective::normalize_batch(bases);
+    G1Projective::msm(&affine, scalars).expect("MSM length mismatch")
 }
 
 // ============================================================================
@@ -489,10 +488,14 @@ pub fn verify_refresh(
         &bp_extra,
     )?;
 
-    // 7. Pairing check
-    let pairing_left = ark_bls12_381::Bls12_381::pairing(proof.a_prime, *pk_master);
-    let pairing_right = ark_bls12_381::Bls12_381::pairing(proof.a_bar, generators.g2);
-    if pairing_left.0 != pairing_right.0 {
+    // 7. Pairing check: e(A', pk_master) == e(A_bar, g2).
+    // Combined into a single multi-pairing (one shared Miller loop + one final
+    // exponentiation) rather than two separate pairings.
+    let pairing_check = ark_bls12_381::Bls12_381::multi_pairing(
+        [proof.a_prime.into_affine(), (-proof.a_bar).into_affine()],
+        [(*pk_master).into_affine(), generators.g2.into_affine()],
+    );
+    if pairing_check.0 != Fq12::ONE {
         return Err(ActError::VerificationFailed("Pairing check failed".into()));
     }
 

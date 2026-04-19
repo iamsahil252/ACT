@@ -10,6 +10,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use ark_std::vec;
 use ark_bls12_381::G1Projective;
+use ark_ec::{CurveGroup, VariableBaseMSM};
 use ark_ff::Field;
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::RngCore;
@@ -21,11 +22,10 @@ use crate::hash::hash_to_scalar;
 use crate::setup::{Generators, ServerKeys};
 use crate::types::Scalar;
 
+/// Efficient MSM using batch affine normalization + Pippenger's algorithm.
 fn msm_projective(bases: &[G1Projective], scalars: &[ark_bls12_381::Fr]) -> G1Projective {
-    bases
-        .iter()
-        .zip(scalars.iter())
-        .fold(G1Projective::zero(), |acc, (b, s)| acc + (*b * *s))
+    let affine = G1Projective::normalize_batch(bases);
+    G1Projective::msm(&affine, scalars).expect("MSM length mismatch")
 }
 
 // ============================================================================
