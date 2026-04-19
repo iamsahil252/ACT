@@ -35,10 +35,9 @@ use alloc::vec::Vec;
 use ark_bls12_381::{Fr, G1Projective};
 use ark_ec::CurveGroup;
 use ark_ff::PrimeField;
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_serialize::CanonicalSerialize;
 use ark_std::rand::{CryptoRng, RngCore};
-use ark_std::{UniformRand, Zero};
-use num_bigint::BigUint;
+use ark_std::{UniformRand};
 use sha2::{Digest, Sha256};
 
 use bulletproofs::{BulletproofGens, PedersenGens, RangeProof as DalekRangeProof};
@@ -62,6 +61,84 @@ const Q_25519_LE: [u8; 32] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
 ];
 
+// Precomputed limb form of Q_25519 for the inline u64 comparator.
+const Q_25519_LIMBS: [u64; 4] = {
+    let b = Q_25519_LE;
+    [
+        u64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]),
+        u64::from_le_bytes([b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]]),
+        u64::from_le_bytes([b[16],b[17],b[18],b[19],b[20],b[21],b[22],b[23]]),
+        u64::from_le_bytes([b[24],b[25],b[26],b[27],b[28],b[29],b[30],b[31]]),
+    ]
+};
+
+// ============================================================================
+// Inline 256-bit integer arithmetic (stack-allocated, no heap)
+//
+// Replaces num-bigint::BigUint for the hot BEQ prover/verifier path.
+// Representation: four little-endian u64 limbs (limbs[0] is least significant).
+// ============================================================================
+
+/// Load a 256-bit integer from a 32-byte little-endian array.
+#[inline]
+fn u256_from_le_bytes(bytes: &[u8; 32]) -> [u64; 4] {
+    let mut limbs = [0u64; 4];
+    for (i, chunk) in bytes.chunks_exact(8).enumerate() {
+        limbs[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+    }
+    limbs
+}
+
+/// Store a 256-bit integer into a 32-byte little-endian array.
+#[inline]
+fn u256_to_le_bytes(limbs: &[u64; 4]) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    for (i, &l) in limbs.iter().enumerate() {
+        bytes[i * 8..(i + 1) * 8].copy_from_slice(&l.to_le_bytes());
+    }
+    bytes
+}
+
+/// Compare two 256-bit integers: returns `true` if `a < b`.
+#[inline]
+fn u256_lt(a: &[u64; 4], b: &[u64; 4]) -> bool {
+    for i in (0..4).rev() {
+        if a[i] != b[i] { return a[i] < b[i]; }
+    }
+    false // equal
+}
+
+/// Multiply a 256-bit integer by a 64-bit value, returning the low 256 bits.
+/// Callers must ensure no overflow (the product fits in 256 bits).
+#[inline]
+fn u256_mul_u64(a: &[u64; 4], b: u64) -> [u64; 4] {
+    let mut result = [0u64; 4];
+    let mut carry = 0u128;
+    for i in 0..4 {
+        let prod = a[i] as u128 * b as u128 + carry;
+        result[i] = prod as u64;
+        carry = prod >> 64;
+    }
+    // Caller guarantees the product fits; any carry here would be a bug.
+    debug_assert_eq!(carry, 0, "u256_mul_u64: overflow");
+    result
+}
+
+/// Add two 256-bit integers, returning the low 256 bits.
+/// Callers must ensure no overflow (the sum fits in 256 bits).
+#[inline]
+fn u256_add(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    let mut result = [0u64; 4];
+    let mut carry = 0u128;
+    for i in 0..4 {
+        let sum = a[i] as u128 + b[i] as u128 + carry;
+        result[i] = sum as u64;
+        carry = sum >> 64;
+    }
+    debug_assert_eq!(carry, 0, "u256_add: overflow");
+    result
+}
+
 // ============================================================================
 // Proof Structure
 // ============================================================================
@@ -70,11 +147,23 @@ const Q_25519_LE: [u8; 32] = [
 /// Curve25519 Pedersen commitment, together with a Dalek range proof showing
 /// the committed value lies in `[0, 2³²−1]`.
 #[derive(Clone, Debug)]
+/// A dual-curve Sigma protocol proof of equality between a BLS12-381 and a
+/// Curve25519 Pedersen commitment, together with a Dalek range proof showing
+/// the committed value lies in `[0, 2³²−1]`.
+///
+/// # Transcript Compression
+///
+/// The Schnorr commitment points `R_BLS` and `R_25519` are **not transmitted**
+/// over the wire.  Instead the prover stores the 128-bit challenge `c` directly
+/// in the proof.  The verifier reconstructs the R points from the responses and
+/// the public commitments (`R = z·G − c·C`), then checks that their hash
+/// matches `c`.  This saves 64 bytes per proof (48 B for R_BLS + 32 B for
+/// R_25519 − 16 B for c) and eliminates two elliptic-curve decompressions on
+/// the server.
 pub struct BatchedEqualityProof {
-    /// BLS12-381 Schnorr commitment `R_BLS = u_m·h4 + u_r·h0` (compressed, 48 B).
-    pub r_bls_bytes: [u8; 48],
-    /// Curve25519 Schnorr commitment `R_25519 = u_m·G + u_r·H` (compressed, 32 B).
-    pub r_25519_bytes: [u8; 32],
+    /// 128-bit Fiat–Shamir challenge (16 B).  The verifier uses this to
+    /// reconstruct the Schnorr commitments R without transmitting them.
+    pub c_bytes: [u8; 16],
     /// Curve25519 Pedersen commitment `C_25519 = m·G + r_25519·H` (compressed, 32 B).
     pub c_25519_bytes: [u8; 32],
     /// Integer response `z_e = u_m + c·m` in ℤ, little-endian 32-byte encoding.
@@ -93,14 +182,13 @@ pub struct BatchedEqualityProof {
 impl BatchedEqualityProof {
     /// Canonical byte serialization for use in Fiat–Shamir transcripts.
     ///
-    /// Format: `r_bls(48) ∥ r_25519(32) ∥ c_25519(32) ∥ z_e(32) ∥ z_r_bls(32) ∥
+    /// Format: `c(16) ∥ c_25519(32) ∥ z_e(32) ∥ z_r_bls(32) ∥
     ///          z_r_25519(32) ∥ range_len(4 LE) ∥ range_proof(variable)`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            48 + 32 + 32 + 32 + 32 + 32 + 4 + self.range_proof_bytes.len(),
+            16 + 32 + 32 + 32 + 32 + 4 + self.range_proof_bytes.len(),
         );
-        buf.extend_from_slice(&self.r_bls_bytes);
-        buf.extend_from_slice(&self.r_25519_bytes);
+        buf.extend_from_slice(&self.c_bytes);
         buf.extend_from_slice(&self.c_25519_bytes);
         buf.extend_from_slice(&self.z_e_bytes);
         buf.extend_from_slice(&self.z_r_bls_bytes);
@@ -146,7 +234,9 @@ fn rand_dalek_scalar(rng: &mut (impl CryptoRng + RngCore)) -> DalekScalar {
 /// Derive the 128-bit cross-curve challenge `c` by hashing all public
 /// commitments and context.
 ///
-/// This is truncated deliberately: `m ≤ 2³²` and `c < 2¹²⁸` ensures
+/// The hash commits to both C_BLS and C_25519 (binding the prover's values)
+/// and to R_BLS and R_25519 (the Schnorr commitments that randomise the proof).
+/// The resulting c is truncated to 128 bits: `m ≤ 2³²` and `c < 2¹²⁸` ensures
 /// `c·m < 2¹⁶⁰`, and adding the 240-bit blinder `u_m` keeps `z_e < 2²⁴¹`.
 /// Both curve orders are > 2²⁵², so no modular wrap can occur.
 fn compute_beq_challenge(
@@ -240,11 +330,12 @@ pub fn prove_batched_equality(
     // ── Step 2: Integer blinding factor u_m (240 bits = 30 bytes) ────────────
     let mut u_m_le30 = [0u8; 30];
     rng.fill_bytes(&mut u_m_le30);
-    let u_m = BigUint::from_bytes_le(&u_m_le30);
 
     // Represent u_m as a 32-byte LE array (fits in 32 bytes since 240 < 256).
     let mut u_m_32 = [0u8; 32];
     u_m_32[..30].copy_from_slice(&u_m_le30);
+    // Stack-allocated 256-bit limb representation of u_m.
+    let u_m_limbs = u256_from_le_bytes(&u_m_32);
 
     // Convert u_m into BLS12-381 Fr (no reduction: u_m < 2²⁴⁰ < q_BLS).
     let u_m_bls = Fr::from_le_bytes_mod_order(&u_m_32);
@@ -287,17 +378,18 @@ pub fn prove_batched_equality(
         &range_proof_bytes,
     );
     let c_32 = c128_to_bytes32(&c128);
-    let c_big = BigUint::from_bytes_le(&c128);
+    // Stack-allocated 256-bit representation of c (upper 16 bytes are zero).
+    let c_limbs = u256_from_le_bytes(&c_32);
     let c_fr = Fr::from_le_bytes_mod_order(&c_32);
     let c_dalek = DalekScalar::from_bytes_mod_order(c_32);
 
     // ── Step 7: Integer response z_e = u_m + c·m  (over ℤ, no modulo) ────────
-    let z_e = u_m + &c_big * BigUint::from(m as u64);
-    // z_e < 2²⁴¹; fits in ≤ 31 bytes.
-    let z_e_le = z_e.to_bytes_le();
-    debug_assert!(z_e_le.len() <= 31, "z_e unexpectedly exceeded 31 bytes");
-    let mut z_e_bytes = [0u8; 32];
-    z_e_bytes[..z_e_le.len()].copy_from_slice(&z_e_le);
+    // c ≤ 2¹²⁸, m ≤ 2³², so c·m ≤ 2¹⁶⁰; u_m ≤ 2²⁴⁰; sum ≤ 2²⁴¹ — fits in U256.
+    let cm_limbs = u256_mul_u64(&c_limbs, m as u64);
+    let z_e_limbs = u256_add(&u_m_limbs, &cm_limbs);
+    let z_e_bytes = u256_to_le_bytes(&z_e_limbs);
+    // Sanity: the honest prover never exceeds 31 bytes of significant content.
+    debug_assert!(z_e_bytes[31] == 0, "z_e unexpectedly exceeded 31 bytes");
 
     // ── Step 8: BLS12-381 randomness response ────────────────────────────────
     let z_r_bls = u_r_bls + c_fr * r_bls;
@@ -310,10 +402,12 @@ pub fn prove_batched_equality(
     let z_r_25519 = u_r_25519 + c_dalek * r_25519;
     let z_r_25519_bytes: [u8; 32] = z_r_25519.to_bytes();
 
-    // ── Assemble proof ────────────────────────────────────────────────────────
+    // ── Assemble proof (transcript-compressed: c stored instead of R points) ──
+    // R_BLS (48 B) and R_25519 (32 B) are omitted from the wire format.
+    // The verifier reconstructs them from the responses and the committed
+    // challenge, saving 64 bytes per proof.
     let proof = BatchedEqualityProof {
-        r_bls_bytes,
-        r_25519_bytes,
+        c_bytes: c128,
         c_25519_bytes,
         z_e_bytes,
         z_r_bls_bytes,
@@ -330,14 +424,14 @@ pub fn prove_batched_equality(
 
 /// Verify a [`BatchedEqualityProof`] against the BLS12-381 commitment `c_bls`.
 ///
-/// The proof is accepted if and only if:
+/// The proof uses transcript compression: R_BLS and R_25519 are not transmitted;
+/// instead the prover stores the 128-bit challenge `c`.  The verifier:
 ///
-/// 1. `z_e < q₂₅₅₁₉` (bounds check, prevents modular wrap attacks).
-/// 2. BLS12-381 Schnorr equation holds:
-///    `z_m_bls·h4 + z_r_bls·h0 = R_BLS + c·C_BLS`.
-/// 3. Curve25519 Schnorr equation holds:
-///    `z_m_25519·G + z_r_25519·H = R_25519 + c·C_25519`.
-/// 4. Dalek range proof verifies `m ∈ [0, 2³²−1]` against `C_25519`.
+/// 1. Checks `z_e < q₂₅₅₁₉` (prevents modular wrap attacks).
+/// 2. Reconstructs `R_BLS = z_m_bls·h4 + z_r_bls·h0 − c·C_BLS` (no decompression).
+/// 3. Reconstructs `R_25519 = z_m_25519·G + z_r_25519·H − c·C_25519` (no decompression).
+/// 4. Verifies `H(context, C_BLS, C_25519, R_BLS, R_25519, range_proof) == c`.
+/// 5. Verifies the Dalek range proof `m ∈ [0, 2³²−1]` against `C_25519`.
 ///
 /// # Parameters
 /// * `c_bls`   – The BLS12-381 commitment from the spend proof (`C_BP`).
@@ -352,80 +446,69 @@ pub fn verify_batched_equality(
 ) -> Result<()> {
     // ── 1. Bounds check: z_e < q₂₅₅₁₉ ──────────────────────────────────────
     // The honest prover always produces z_e < 2²⁴¹ ≪ q₂₅₅₁₉.  We compare
-    // BigUint representations for a precise check.
-    let q_25519 = BigUint::from_bytes_le(&Q_25519_LE);
-    let z_e = BigUint::from_bytes_le(&proof.z_e_bytes);
-    if z_e >= q_25519 {
+    // using inline u64-limb arithmetic to avoid heap allocation.
+    let z_e_limbs = u256_from_le_bytes(&proof.z_e_bytes);
+    if !u256_lt(&z_e_limbs, &Q_25519_LIMBS) {
         return Err(ActError::VerificationFailed(
             "BatchedEqualityProof: z_e >= q_25519 (modular wrap attack)".into(),
         ));
     }
 
-    // ── 2. Project z_e into the respective scalar fields ─────────────────────
-    // Since z_e < q₂₅₅₁₉ < q_BLS, both reductions are no-ops; the integer
-    // value is preserved exactly in both scalars.
-    let z_m_bls = Fr::from_le_bytes_mod_order(&proof.z_e_bytes);
-    let z_m_25519 = DalekScalar::from_bytes_mod_order(proof.z_e_bytes);
+    // ── 2. Read scalar responses ──────────────────────────────────────────────
+    // Since z_e < q₂₅₅₁₉ < q_BLS, both reductions are no-ops.
+    let z_m_bls    = Fr::from_le_bytes_mod_order(&proof.z_e_bytes);
+    let z_m_25519  = DalekScalar::from_bytes_mod_order(proof.z_e_bytes);
+    let z_r_bls    = Fr::from_le_bytes_mod_order(&proof.z_r_bls_bytes);
+    let z_r_25519  = DalekScalar::from_bytes_mod_order(proof.z_r_25519_bytes);
 
-    // ── 3. Deserialize proof elements ────────────────────────────────────────
-    let r_bls_affine = ark_bls12_381::G1Affine::deserialize_compressed(&proof.r_bls_bytes[..])
-        .map_err(|_| {
-            ActError::VerificationFailed("BatchedEqualityProof: invalid R_BLS bytes".into())
-        })?;
-    let r_bls_point: G1Projective = r_bls_affine.into();
+    // ── 3. Read the stored challenge and expand to scalar form ───────────────
+    let c128   = proof.c_bytes;
+    let c_32   = c128_to_bytes32(&c128);
+    let c_fr   = Fr::from_le_bytes_mod_order(&c_32);
+    let c_dalek = DalekScalar::from_bytes_mod_order(c_32);
 
-    let r_25519_compressed = CompressedRistretto(proof.r_25519_bytes);
-    let r_25519_point: RistrettoPoint = r_25519_compressed.decompress().ok_or_else(|| {
-        ActError::VerificationFailed("BatchedEqualityProof: invalid R_25519 point".into())
-    })?;
-
+    // ── 4. Deserialize C_25519 ───────────────────────────────────────────────
     let c_25519_compressed = CompressedRistretto(proof.c_25519_bytes);
     let c_25519_point: RistrettoPoint = c_25519_compressed.decompress().ok_or_else(|| {
         ActError::VerificationFailed("BatchedEqualityProof: invalid C_25519 point".into())
     })?;
 
-    let z_r_bls = Fr::from_le_bytes_mod_order(&proof.z_r_bls_bytes);
-    let z_r_25519 = DalekScalar::from_bytes_mod_order(proof.z_r_25519_bytes);
+    // ── 5. Reconstruct R points from responses (transcript compression) ──────
+    // R_BLS  = z_m·h4 + z_r·h0 − c·C_BLS
+    // R_25519 = z_m·G + z_r·H  − c·C_25519
+    // These are the Schnorr commitments the prover used when computing c.
+    // They match exactly when the proof is honest; soundness follows from
+    // the collision-resistance of SHA-256.
 
-    // ── 4. Recompute the 128-bit challenge ───────────────────────────────────
+    let r_bls_point = h4 * z_m_bls + h0 * z_r_bls - c_bls * c_fr;
+    let mut r_bls_recon_bytes = [0u8; 48];
+    r_bls_point
+        .into_affine()
+        .serialize_compressed(&mut r_bls_recon_bytes[..])
+        .map_err(ActError::SerializationError)?;
+
+    let pc_gens = dalek_pc_gens();
+    let r_25519_point = pc_gens.commit(z_m_25519, z_r_25519) - c_25519_point * c_dalek;
+    let r_25519_recon_bytes: [u8; 32] = r_25519_point.compress().to_bytes();
+
+    // ── 6. Serialize C_BLS and verify the challenge hash ────────────────────
     let mut c_bls_bytes_48 = [0u8; 48];
     c_bls
         .into_affine()
         .serialize_compressed(&mut c_bls_bytes_48[..])
         .map_err(ActError::SerializationError)?;
 
-    let c128 = compute_beq_challenge(
+    let expected_c128 = compute_beq_challenge(
         context,
         &c_bls_bytes_48,
         &proof.c_25519_bytes,
-        &proof.r_bls_bytes,
-        &proof.r_25519_bytes,
+        &r_bls_recon_bytes,
+        &r_25519_recon_bytes,
         &proof.range_proof_bytes,
     );
-    let c_32 = c128_to_bytes32(&c128);
-    let c_fr = Fr::from_le_bytes_mod_order(&c_32);
-    let c_dalek = DalekScalar::from_bytes_mod_order(c_32);
-
-    // ── 5. BLS12-381 Schnorr check ────────────────────────────────────────────
-    // LHS: z_m_bls·h4 + z_r_bls·h0
-    let lhs_bls = h4 * z_m_bls + h0 * z_r_bls;
-    // RHS: R_BLS + c·C_BLS
-    let rhs_bls = r_bls_point + c_bls * c_fr;
-    if lhs_bls != rhs_bls {
+    if expected_c128 != c128 {
         return Err(ActError::VerificationFailed(
-            "BatchedEqualityProof: BLS12-381 Schnorr check failed".into(),
-        ));
-    }
-
-    // ── 6. Curve25519 Schnorr check ──────────────────────────────────────────
-    let pc_gens = dalek_pc_gens();
-    // LHS: z_m_25519·G + z_r_25519·H  =  pc_gens.commit(z_m_25519, z_r_25519)
-    let lhs_25519 = pc_gens.commit(z_m_25519, z_r_25519);
-    // RHS: R_25519 + c·C_25519
-    let rhs_25519 = r_25519_point + c_25519_point * c_dalek;
-    if lhs_25519 != rhs_25519 {
-        return Err(ActError::VerificationFailed(
-            "BatchedEqualityProof: Curve25519 Schnorr check failed".into(),
+            "BatchedEqualityProof: challenge mismatch (Schnorr check failed)".into(),
         ));
     }
 
@@ -571,7 +654,8 @@ mod tests {
         let (proof, _) =
             prove_batched_equality(&mut rng, 100, r_bls, gens.h[4], gens.h[0], b"t").unwrap();
         let bytes = proof.to_bytes();
-        // Minimum: 48+32+32+32+32+32+4 = 212 bytes header + range proof.
-        assert!(bytes.len() >= 212);
+        // Header: c(16) + c_25519(32) + z_e(32) + z_r_bls(32) + z_r_25519(32) + range_len(4) = 148 bytes
+        // plus the variable-length range proof (≈ 673 bytes for 32-bit).
+        assert!(bytes.len() >= 148);
     }
 }
