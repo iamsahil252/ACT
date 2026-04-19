@@ -16,13 +16,12 @@ use alloc::vec::Vec;
 use ark_std::vec;
 use ark_bls12_381::{G1Projective, G2Projective};
 use ark_ec::{CurveGroup, VariableBaseMSM, pairing::Pairing};
-use ark_ff::{Field, PrimeField};
+use ark_ff::Field;
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::{CryptoRng, RngCore};
 use ark_std::Zero;
-use crate::bbs_proof::{BbsProof, BbsProofContext, BbsSignature};
+use crate::bbs_proof::BbsSignature;
 use crate::bulletproofs::{prove_range, serialize_proof, verify_range, RangeProof};
-use crate::commitments::{verify_bridge, verify_bridge_single_base};
 use crate::error::{ActError, Result};
 use crate::hash::{hash_to_scalar};
 use crate::setup::{Generators, ServerKeys};
@@ -76,8 +75,9 @@ pub struct SpendProof {
 }
 
 /// Server response containing the blind Refund Token.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SpendResponse {
+    #[serde(with = "crate::types::g1_serde")]
     pub a_refund: G1Projective,
     pub e_refund: Scalar,
     pub s_prime_refund: Scalar,
@@ -529,7 +529,6 @@ mod tests {
     use crate::hash::compute_h_ctx;
     use crate::setup::{Generators, ServerKeys};
     use crate::types::Scalar;
-    use crate::commitments::commit;
     use ark_std::rand::thread_rng;
 
     fn create_daily_signature(

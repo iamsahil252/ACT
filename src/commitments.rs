@@ -7,12 +7,7 @@
 //! - Helper functions for the bridging equalities used in epoch refresh and
 //!   spending phases.
 
-extern crate alloc;
-use alloc::vec::Vec;
-use ark_std::vec;
 use ark_bls12_381::G1Projective;
-use ark_ec::CurveGroup;
-use crate::error::{ActError, Result};
 use crate::types::Scalar;
 
 /// Create a Pedersen commitment to a value with given blinding.

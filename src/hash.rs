@@ -17,7 +17,6 @@ use ark_ec::hashing::{
     map_to_curve_hasher::MapToCurveBasedHasher,
     HashToCurve,
 };
-use ark_ec::Group;
 use ark_ff::field_hashers::DefaultFieldHasher;
 use ark_serialize::CanonicalSerialize;
 use sha2::{Digest, Sha256};
@@ -113,7 +112,6 @@ mod tests {
     use crate::setup::Generators;
     use ark_bls12_381::G2Projective;
     use ark_ec::Group;
-    use ark_std::rand::thread_rng;
 
     #[test]
     fn h_ctx_deterministic() {
