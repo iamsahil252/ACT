@@ -7,7 +7,6 @@ name = "act"
 version = "0.1.0"
 dependencies = [
  "ark-bls12-381",
- "ark-bulletproofs",
  "ark-ec",
  "ark-ff",
  "ark-serialize",
@@ -64,42 +63,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ark-bulletproofs"
-version = "4.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "658f87172dbb71cdc7c9f1dfe85c9f80344623d2716bd73e57db9719b497e48b"
-dependencies = [
- "ark-ec",
- "ark-ed25519",
- "ark-ff",
- "ark-secp256k1",
- "ark-secq256k1",
- "ark-serialize",
- "ark-std",
- "byteorder",
- "clear_on_drop",
- "digest 0.10.7",
- "merlin",
- "rand",
- "rand_chacha",
- "rand_core",
- "serde",
- "serde_derive",
- "sha3 0.10.8",
-]
-
-[[package]]
-name = "ark-curve25519"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ab653b3eff27100f7dcb06b94785f2fbe0d1230408df55d543ee0ef48cd8760"
-dependencies = [
- "ark-ec",
- "ark-ff",
- "ark-std",
-]
-
-[[package]]
 name = "ark-ec"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -114,18 +77,6 @@ dependencies = [
  "itertools",
  "num-traits",
  "zeroize",
-]
-
-[[package]]
-name = "ark-ed25519"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c7ed5162ef7c978cfefffcd08cd8393d174836ae1c9fc8fa2dfcd5c2f03a4a9"
-dependencies = [
- "ark-curve25519",
- "ark-ec",
- "ark-ff",
- "ark-std",
 ]
 
 [[package]]
@@ -182,29 +133,6 @@ dependencies = [
  "ark-std",
  "derivative",
  "hashbrown 0.13.2",
-]
-
-[[package]]
-name = "ark-secp256k1"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c02e954eaeb4ddb29613fee20840c2bbc85ca4396d53e33837e11905363c5f2"
-dependencies = [
- "ark-ec",
- "ark-ff",
- "ark-std",
-]
-
-[[package]]
-name = "ark-secq256k1"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a87789a7a9397bc3f477e4138859ca4cacf2d0903745a30b22b51b20d9da2c7a"
-dependencies = [
- "ark-ec",
- "ark-ff",
- "ark-secp256k1",
- "ark-std",
 ]
 
 [[package]]

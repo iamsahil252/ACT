@@ -18,7 +18,7 @@ use ark_std::rand::thread_rng;
 use rand::RngCore;
 
 use act::{
-    bulletproofs::{prove_range, verify_range},
+    batched_eq::{prove_batched_equality, verify_batched_equality},
     compute_h_ctx,
     epoch_refresh::{verify_refresh, RefreshProof, RefreshProver},
     hash::hash_to_g1,
@@ -71,11 +71,9 @@ const SCALAR_BYTES: usize = 32; // Fr element
 
 fn refresh_proof_size(proof: &RefreshProof) -> usize {
     // BBS+ core (3×G1) + bridge commits (6×G1) + public values (3×G1) +
-    // Schnorr responses (9×Fr) + serialised Bulletproof.
-    let bp = act::bulletproofs::serialize_proof(&proof.bp_exp)
-        .map(|b| b.len())
-        .unwrap_or(0);
-    12 * G1_BYTES + 9 * SCALAR_BYTES + bp
+    // Schnorr responses (9×Fr) + serialised BatchedEqualityProof.
+    let beq = proof.batched_eq.to_bytes().len();
+    12 * G1_BYTES + 9 * SCALAR_BYTES + beq
 }
 
 fn spend_proof_size(proof: &act::spend::SpendProof) -> usize {
@@ -208,7 +206,7 @@ fn performance_profile() {
     st_rv.print("Server verify (challenge + bridges + MSM + BP + pairing):");
 
     let rp = last_rp.as_ref().unwrap();
-    let rp_bp = act::bulletproofs::serialize_proof(&rp.bp_exp).unwrap();
+    let rp_beq = rp.batched_eq.to_bytes();
     let rp_total = refresh_proof_size(rp);
 
     println!();
@@ -218,7 +216,7 @@ fn performance_profile() {
     println!("    Bridge commitments           6×G1  : {} bytes", 6 * G1_BYTES);
     println!("    Public values (N_T, K_d, CΔ) 3×G1  : {} bytes", 3 * G1_BYTES);
     println!("    Schnorr responses            9×Fr  : {} bytes", 9 * SCALAR_BYTES);
-    println!("    Bulletproof  (32-bit range)        : {} bytes", rp_bp.len());
+    println!("    BatchedEqualityProof (dual-curve)  : {} bytes", rp_beq.len());
     println!();
 
     // ── 4. Spend ─────────────────────────────────────────────────────────────
@@ -376,27 +374,27 @@ fn performance_profile() {
     }
     st_h2g1.print("Hash-to-G1  (H_T epoch computation):");
 
-    // 5i. Bulletproof prove  (32-bit range)
-    let bp_val = 42u64;
-    let bp_blind = Scalar::rand(&mut rng);
-    let bp_extra = b"perf-test";
+    // 5i. BatchedEqualityProof prove  (dual-curve, 32-bit range)
+    let beq_val = 42u32;
+    let beq_blind = Scalar::rand(&mut rng);
+    let beq_ctx = b"perf-test";
     let mut st_bpp = Stats::new();
     for _ in 0..ITERS {
         let t = Instant::now();
-        let _ = prove_range(&mut rng, bp_val, bp_blind, 32, generators.h[4], generators.h[0], b"ACT:Perf", bp_extra).unwrap();
+        let _ = prove_batched_equality(&mut rng, beq_val, beq_blind.0, generators.h[4], generators.h[0], beq_ctx).unwrap();
         st_bpp.record(t.elapsed());
     }
-    st_bpp.print("Bulletproof prove   (32-bit range):");
+    st_bpp.print("BatchedEqualityProof prove  (dual-curve, 32-bit):");
 
-    // 5j. Bulletproof verify (32-bit range)
-    let (bp_proof, bp_commit) = prove_range(&mut rng, bp_val, bp_blind, 32, generators.h[4], generators.h[0], b"ACT:Perf", bp_extra).unwrap();
+    // 5j. BatchedEqualityProof verify (dual-curve, 32-bit range)
+    let (beq_proof, beq_commit) = prove_batched_equality(&mut rng, beq_val, beq_blind.0, generators.h[4], generators.h[0], beq_ctx).unwrap();
     let mut st_bpv = Stats::new();
     for _ in 0..ITERS {
         let t = Instant::now();
-        verify_range(&bp_proof, bp_commit, 32, generators.h[4], generators.h[0], b"ACT:Perf", bp_extra).unwrap();
+        verify_batched_equality(&beq_proof, beq_commit, generators.h[4], generators.h[0], beq_ctx).unwrap();
         st_bpv.record(t.elapsed());
     }
-    st_bpv.print("Bulletproof verify  (32-bit range):");
+    st_bpv.print("BatchedEqualityProof verify (dual-curve, 32-bit):");
 
     // 5k. SHA-256 challenge hash (~typical preimage)
     let preimage = vec![0xABu8; 1024];
@@ -433,7 +431,7 @@ fn performance_profile() {
     println!("  {:<47}  {:>9.1} ops/s", "Server: combined (1 refresh + 1 spend)/sec:", 1000.0 / (rv_ms + sv_ms));
     println!("  {:<47}  {:>9.1} ops/s", "Client: refresh proofs/sec:", 1000.0 / rp_ms);
     println!("  {:<47}  {:>9.1} ops/s", "Client: spend proofs/sec:", 1000.0 / sp_ms);
-    println!("  {:<47}  {:>9.1} ops/s", "Bulletproof verify/sec:", 1000.0 / ms(st_bpv.avg()).max(0.001));
+    println!("  {:<47}  {:>9.1} ops/s", "BatchedEqualityProof verify/sec:", 1000.0 / ms(st_bpv.avg()).max(0.001));
     println!();
 
     // ── 7. Summary Table ─────────────────────────────────────────────────────
@@ -452,8 +450,8 @@ fn performance_profile() {
         ("Spend: client prove",                 ms(st_sp.avg()),    sp_total),
         ("Spend: server verify",                ms(st_sv.avg()),    sp_total),
         ("  ↳ Multi-pairing (2 inputs)",        ms(st_mp.avg()),    0),
-        ("  ↳ Bulletproof prove (32-bit)",       ms(st_bpp.avg()),  rp_bp.len()),
-        ("  ↳ Bulletproof verify (32-bit)",      ms(st_bpv.avg()),  0),
+        ("  ↳ BatchedEqProof prove (32-bit)",   ms(st_bpp.avg()),  rp_beq.len()),
+        ("  ↳ BatchedEqProof verify (32-bit)",  ms(st_bpv.avg()),  0),
         ("  ↳ Hash-to-G1 (H_T)",                ms(st_h2g1.avg()), 0),
         ("  ↳ SHA-256 challenge hash",           ms(st_sha.avg()),  0),
     ];
@@ -493,8 +491,9 @@ fn performance_profile() {
     println!("       After : tokio::task::spawn_blocking moves crypto onto a dedicated");
     println!("               OS thread pool, keeping networking fully responsive under load");
     println!();
-    println!("  ⑤ OnceLock-cached BulletproofGens  (bulletproofs.rs, pre-existing)");
-    println!("       128 hash-to-G1 calls amortised across all proofs in the process");
+    println!("  ⑤ BatchedEqualityProof replaces R1CS Bulletproofs for all range proofs");
+    println!("       Both Spend and Epoch Refresh now use the dual-curve Dalek bridge");
+    println!("       eliminating the ark-bulletproofs R1CS dependency entirely");
     println!();
 
     // Sanity assertions — the test itself must pass.
