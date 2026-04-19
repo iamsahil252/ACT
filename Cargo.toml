@@ -22,8 +22,6 @@ ark-ec = { version = "0.4.0", default-features = false }
 ark-ff = { version = "0.4.0", default-features = false }
 ark-serialize = { version = "0.4.0", default-features = false }
 ark-std = { version = "0.4.0", default-features = false }
-# BLS12-381 Bulletproofs using R1CS interface (for epoch-refresh expiry proofs)
-ark-bulletproofs = { version = "4", features = ["yoloproofs"] }
 merlin = { version = "3", default-features = false }
 
 # Dalek Bulletproofs on Curve25519 (for spend-phase range proofs via dual-curve bridge)

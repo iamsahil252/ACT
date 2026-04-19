@@ -63,8 +63,6 @@ pub mod commitments;
 #[cfg(feature = "std")]
 pub mod bbs_proof;
 #[cfg(feature = "std")]
-pub mod bulletproofs;
-#[cfg(feature = "std")]
 pub mod batched_eq;
 
 // Protocol phases

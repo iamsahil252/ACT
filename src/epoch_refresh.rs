@@ -18,8 +18,8 @@ use ark_std::rand::{CryptoRng, RngCore};
 use ark_std::Zero;
 use sha2::Digest as _;
 use ark_std::io::Write as _;
+use crate::batched_eq::{prove_batched_equality, verify_batched_equality, BatchedEqualityProof};
 use crate::bbs_proof::BbsSignature;
-use crate::bulletproofs::{prove_range, serialize_proof, verify_range, RangeProof};
 use crate::error::{ActError, Result};
 use crate::hash::{hash_to_g1, hash_to_scalar_from_hasher, HasherWriter};
 use crate::setup::{Generators, ServerKeys};
@@ -67,7 +67,7 @@ pub struct RefreshProof {
     pub z_w: Scalar,
 
     // Range proof for expiry
-    pub bp_exp: RangeProof,
+    pub batched_eq: BatchedEqualityProof,
 
     // Public values (sent separately but included here for convenience)
     pub n_t: G1Projective,
@@ -292,30 +292,33 @@ impl RefreshProver {
             G1Projective::msm(&bases, &scalars).expect("T_B MSM length mismatch")
         };
 
-        // 9. Generate Bulletproof (needs BBS+ commitments in extra data)
-        // Capacity: 32 h_ctx + 4 epoch + 3*48 G1 points + overallocate for bp
-        let mut bp_extra = Vec::with_capacity(32 + 4 + 3 * 48 + 8);
-        bp_extra.extend_from_slice(&h_ctx.to_bytes());
-        bp_extra.extend_from_slice(&t.to_le_bytes());
-        n_t.serialize_compressed(&mut bp_extra).unwrap();
-        k_daily_commit.serialize_compressed(&mut bp_extra).unwrap();
-        c_delta.serialize_compressed(&mut bp_extra).unwrap();
-        a_prime.serialize_compressed(&mut bp_extra).unwrap();
-        a_bar.serialize_compressed(&mut bp_extra).unwrap();
-        t_bbs.serialize_compressed(&mut bp_extra).unwrap();
-        let (bp_exp, _) = prove_range(
+        // 9. BatchedEqualityProof: prove delta in C_delta (BLS12-381) equals delta in
+        //    C_25519 (Curve25519), and that delta ∈ [0, 2³²−1] via Dalek Bulletproof.
+        //
+        // The context binds the proof to this specific refresh session, preventing
+        // transcript-splicing attacks as required by Section 9.2.
+        let mut beq_context = Vec::new();
+        beq_context.extend_from_slice(&h_ctx.to_bytes());
+        beq_context.extend_from_slice(&t.to_le_bytes());
+        n_t.serialize_compressed(&mut beq_context).unwrap();
+        k_daily_commit.serialize_compressed(&mut beq_context).unwrap();
+        a_prime.serialize_compressed(&mut beq_context).unwrap();
+        a_bar.serialize_compressed(&mut beq_context).unwrap();
+        t_bbs.serialize_compressed(&mut beq_context).unwrap();
+
+        let (batched_eq, c_delta_from_beq) = prove_batched_equality(
             rng,
-            delta as u64,
-            r_delta,
-            32,
+            delta,
+            r_delta.0,
             generators.h[3],
             generators.h[0],
-            b"ACT:Expiry",
-            &bp_extra,
+            &beq_context,
         )?;
+        // Sanity: c_delta_from_beq must match c_delta (same delta and r_delta).
+        debug_assert_eq!(c_delta, c_delta_from_beq, "c_delta mismatch");
+        let beq_bytes = batched_eq.to_bytes();
 
         // 10. Challenge — feed all elements directly into SHA-256, no intermediate Vec.
-        let bp_bytes = serialize_proof(&bp_exp).unwrap();
         let c = {
             let mut hasher = sha2::Sha256::new();
             let mut w = HasherWriter(&mut hasher);
@@ -325,7 +328,7 @@ impl RefreshProver {
             n_t.serialize_compressed(&mut w).unwrap();
             k_daily_commit.serialize_compressed(&mut w).unwrap();
             c_delta.serialize_compressed(&mut w).unwrap();
-            w.write_all(&bp_bytes).unwrap();
+            w.write_all(&beq_bytes).unwrap();
             a_prime.serialize_compressed(&mut w).unwrap();
             a_bar.serialize_compressed(&mut w).unwrap();
             t_bbs.serialize_compressed(&mut w).unwrap();
@@ -370,7 +373,7 @@ impl RefreshProver {
             z_u,
             z_v,
             z_w,
-            bp_exp,
+            batched_eq,
             n_t,
             k_daily: k_daily_commit,
             c_delta,
@@ -416,7 +419,7 @@ pub fn verify_refresh(
     let c_bridge = proof.c_delta + generators.h[3] * Scalar::from(current_epoch).0;
 
     // 3. Recompute challenge — feed all elements directly into SHA-256.
-    let bp_bytes = serialize_proof(&proof.bp_exp).unwrap();
+    let beq_bytes = proof.batched_eq.to_bytes();
     let c = {
         let mut hasher = sha2::Sha256::new();
         let mut w = HasherWriter(&mut hasher);
@@ -426,7 +429,7 @@ pub fn verify_refresh(
         proof.n_t.serialize_compressed(&mut w).unwrap();
         proof.k_daily.serialize_compressed(&mut w).unwrap();
         proof.c_delta.serialize_compressed(&mut w).unwrap();
-        w.write_all(&bp_bytes).unwrap();
+        w.write_all(&beq_bytes).unwrap();
         proof.a_prime.serialize_compressed(&mut w).unwrap();
         proof.a_bar.serialize_compressed(&mut w).unwrap();
         proof.t_bbs.serialize_compressed(&mut w).unwrap();
@@ -547,24 +550,24 @@ pub fn verify_refresh(
         }
     }
 
-    // 6. Bulletproof verification
-    let mut bp_extra = Vec::with_capacity(32 + 4 + 6 * 48);
-    bp_extra.extend_from_slice(&h_ctx.to_bytes());
-    bp_extra.extend_from_slice(&current_epoch.to_le_bytes());
-    proof.n_t.serialize_compressed(&mut bp_extra).unwrap();
-    proof.k_daily.serialize_compressed(&mut bp_extra).unwrap();
-    proof.c_delta.serialize_compressed(&mut bp_extra).unwrap();
-    proof.a_prime.serialize_compressed(&mut bp_extra).unwrap();
-    proof.a_bar.serialize_compressed(&mut bp_extra).unwrap();
-    proof.t_bbs.serialize_compressed(&mut bp_extra).unwrap();
-    verify_range(
-        &proof.bp_exp,
+    // 6. BatchedEqualityProof verification: checks that delta in C_delta (BLS12-381)
+    //    equals delta in C_25519 (Curve25519), and that delta ∈ [0, 2³²−1] via Dalek.
+    //
+    //    The beq_context mirrors what the prover bound into the inner challenge.
+    let mut beq_context = Vec::new();
+    beq_context.extend_from_slice(&h_ctx.to_bytes());
+    beq_context.extend_from_slice(&current_epoch.to_le_bytes());
+    proof.n_t.serialize_compressed(&mut beq_context).unwrap();
+    proof.k_daily.serialize_compressed(&mut beq_context).unwrap();
+    proof.a_prime.serialize_compressed(&mut beq_context).unwrap();
+    proof.a_bar.serialize_compressed(&mut beq_context).unwrap();
+    proof.t_bbs.serialize_compressed(&mut beq_context).unwrap();
+    verify_batched_equality(
+        &proof.batched_eq,
         proof.c_delta,
-        32,
         generators.h[3],
         generators.h[0],
-        b"ACT:Expiry",
-        &bp_extra,
+        &beq_context,
     )?;
 
     // 7. Pairing check: e(A', pk_master) == e(A_bar, g2).
