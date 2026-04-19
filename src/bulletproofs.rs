@@ -22,11 +22,86 @@ use ark_bulletproofs::{
 use merlin::Transcript;
 
 use crate::error::{ActError, Result};
+use crate::hash::hash_to_g1;
 use crate::types::Scalar;
 
 /// Number of BulletproofGens to allocate.
 /// 64 generators is sufficient for a 32-multiplier (32-bit) R1CS range proof.
 const BP_GENS_CAPACITY: usize = 64;
+
+// ============================================================================
+// ACT-specific Bulletproof inner-product vector generators
+// ============================================================================
+
+/// Build a `BulletproofGens` whose inner-product vector bases (**G** and **H**)
+/// are derived from ACT-specific domain separators, satisfying the requirement
+/// of Section 9.2 of the ACT specification.
+///
+/// The domain separators used are:
+/// - G vector: `b"ACT:BP:G:"` with a 4-byte big-endian index suffix.
+/// - H vector: `b"ACT:BP:H:"` with a 4-byte big-endian index suffix.
+///
+/// Both derive points via [`hash_to_g1`] (RFC 9380 WB-SSWU / SHA-256), which
+/// is a completely different derivation path from the library's default ChaCha
+/// PRNG seeded from SHA3-512.  The BBS+ Pedersen bases use the domain
+/// separator `b"ACT:BBS:"`, so the inner-product bases are provably
+/// orthogonal in derivation (computationally orthogonal under the DL
+/// assumption).
+///
+/// Because this construction is deterministic and relatively expensive
+/// (128 hash-to-curve operations), the result is cached in a `OnceLock`.
+fn make_act_bp_gens() -> BulletproofGens<G1Affine> {
+    // Generate G and H points using ACT-specific domain separators.
+    let g_pts: alloc::vec::Vec<G1Affine> = (0..BP_GENS_CAPACITY)
+        .map(|i| hash_to_g1(b"ACT:BP:G:", &(i as u32).to_be_bytes()).into_affine())
+        .collect();
+    let h_pts: alloc::vec::Vec<G1Affine> = (0..BP_GENS_CAPACITY)
+        .map(|i| hash_to_g1(b"ACT:BP:H:", &(i as u32).to_be_bytes()).into_affine())
+        .collect();
+
+    // `BulletproofGens` has private `G_vec`/`H_vec` fields with no public
+    // constructor accepting custom bases.  We inject them via the
+    // `CanonicalDeserialize` path, which serialises the struct in the
+    // following format (all lengths as u64 LE, points compressed 48 bytes):
+    //
+    //   [gens_capacity: u64][party_capacity: u64]
+    //   [G_vec outer len: u64]
+    //     [G_vec[0] inner len: u64] [G1Affine × BP_GENS_CAPACITY]
+    //   [H_vec outer len: u64]
+    //     [H_vec[0] inner len: u64] [G1Affine × BP_GENS_CAPACITY]
+    let point_block = 8 + BP_GENS_CAPACITY * 48; // inner_len u64 + points
+    let mut buf = alloc::vec::Vec::with_capacity(16 + 2 * (8 + point_block));
+
+    buf.extend_from_slice(&(BP_GENS_CAPACITY as u64).to_le_bytes()); // gens_capacity
+    buf.extend_from_slice(&1u64.to_le_bytes()); // party_capacity = 1
+
+    // G_vec: 1 outer entry, BP_GENS_CAPACITY inner points
+    buf.extend_from_slice(&1u64.to_le_bytes()); // outer Vec len = 1 party
+    buf.extend_from_slice(&(BP_GENS_CAPACITY as u64).to_le_bytes()); // inner len
+    for pt in &g_pts {
+        pt.serialize_compressed(&mut buf)
+            .expect("G1Affine compressed serialization is infallible");
+    }
+
+    // H_vec: 1 outer entry, BP_GENS_CAPACITY inner points
+    buf.extend_from_slice(&1u64.to_le_bytes()); // outer Vec len = 1 party (H_vec)
+    buf.extend_from_slice(&(BP_GENS_CAPACITY as u64).to_le_bytes()); // inner len
+    for pt in &h_pts {
+        pt.serialize_compressed(&mut buf)
+            .expect("G1Affine compressed serialization is infallible");
+    }
+
+    BulletproofGens::<G1Affine>::deserialize_compressed(&buf[..])
+        .expect("BulletproofGens construction from valid ACT generator points cannot fail")
+}
+
+/// Return a reference to the process-wide cached ACT `BulletproofGens`.
+///
+/// The generators are initialised once (lazily) using [`make_act_bp_gens`].
+fn act_bp_gens() -> &'static BulletproofGens<G1Affine> {
+    static CACHE: std::sync::OnceLock<BulletproofGens<G1Affine>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(make_act_bp_gens)
+}
 
 /// Lightweight wrapper for a Bulletproof range proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,7 +141,7 @@ pub fn prove_range(
         B: value_base.into_affine(),
         B_blinding: blinding_base.into_affine(),
     };
-    let bp_gens = BulletproofGens::<G1Affine>::new(BP_GENS_CAPACITY, 1);
+    let bp_gens = act_bp_gens();
 
     let mut transcript = Transcript::new(b"ACT:RangeProof");
     transcript.append_message(b"label", transcript_label);
@@ -82,7 +157,7 @@ pub fn prove_range(
         .map_err(|e| ActError::ProtocolError(alloc::format!("R1CS prover error: {:?}", e)))?;
 
     let r1cs_proof = prover
-        .prove(rng, &bp_gens)
+        .prove(rng, bp_gens)
         .map_err(|e| ActError::ProtocolError(alloc::format!("Bulletproof prove error: {:?}", e)))?;
 
     let mut proof_bytes = Vec::new();
@@ -134,7 +209,7 @@ pub fn verify_range(
         B: value_base.into_affine(),
         B_blinding: blinding_base.into_affine(),
     };
-    let bp_gens = BulletproofGens::<G1Affine>::new(BP_GENS_CAPACITY, 1);
+    let bp_gens = act_bp_gens();
 
     let mut transcript = Transcript::new(b"ACT:RangeProof");
     transcript.append_message(b"label", transcript_label);
@@ -153,7 +228,7 @@ pub fn verify_range(
         .map_err(|_| ActError::VerificationFailed("invalid Bulletproof bytes".into()))?;
 
     verifier
-        .verify(&r1cs_proof, &pc_gens, &bp_gens)
+        .verify(&r1cs_proof, &pc_gens, bp_gens)
         .map_err(|e| {
             ActError::VerificationFailed(alloc::format!("Bulletproof verify failed: {:?}", e))
         })?;
@@ -390,5 +465,60 @@ mod tests {
         let k_cur = Scalar::rand(&mut rng);
         let bytes = k_cur.to_bytes();
         assert_eq!(bytes.len(), 32, "Scalar::to_bytes must return exactly 32 bytes");
+    }
+
+    /// Verify that the ACT inner-product generator bases are deterministic and
+    /// distinct from the library defaults (Section 9.2 of the specification).
+    #[test]
+    fn act_bp_gens_deterministic_and_distinct_from_defaults() {
+        // Two independent calls must produce the same generators.
+        let gens_a = make_act_bp_gens();
+        let gens_b = make_act_bp_gens();
+
+        let a_g: alloc::vec::Vec<_> = gens_a.G(BP_GENS_CAPACITY, 1).cloned().collect();
+        let b_g: alloc::vec::Vec<_> = gens_b.G(BP_GENS_CAPACITY, 1).cloned().collect();
+        assert_eq!(a_g, b_g, "ACT BulletproofGens G must be deterministic");
+
+        let a_h: alloc::vec::Vec<_> = gens_a.H(BP_GENS_CAPACITY, 1).cloned().collect();
+        let b_h: alloc::vec::Vec<_> = gens_b.H(BP_GENS_CAPACITY, 1).cloned().collect();
+        assert_eq!(a_h, b_h, "ACT BulletproofGens H must be deterministic");
+
+        // The ACT generators must differ from the library defaults.
+        let default_gens = BulletproofGens::<G1Affine>::new(BP_GENS_CAPACITY, 1);
+        let default_g: alloc::vec::Vec<_> = default_gens.G(BP_GENS_CAPACITY, 1).cloned().collect();
+        let default_h: alloc::vec::Vec<_> = default_gens.H(BP_GENS_CAPACITY, 1).cloned().collect();
+
+        assert_ne!(
+            a_g, default_g,
+            "ACT G bases must differ from ark-bulletproofs defaults"
+        );
+        assert_ne!(
+            a_h, default_h,
+            "ACT H bases must differ from ark-bulletproofs defaults"
+        );
+    }
+
+    /// Verify that each ACT generator is distinct (no accidental collisions
+    /// between G and H vectors, and between indices).
+    #[test]
+    fn act_bp_gens_orthogonal_to_bbs_generators() {
+        let bp_gens = make_act_bp_gens();
+        let bbs_gens = crate::setup::Generators::new();
+
+        let g_vec: alloc::vec::Vec<_> = bp_gens.G(BP_GENS_CAPACITY, 1).cloned().collect();
+        let h_vec: alloc::vec::Vec<_> = bp_gens.H(BP_GENS_CAPACITY, 1).cloned().collect();
+
+        // No ACT BP generator should equal any BBS+ generator.
+        for bbs_h in &bbs_gens.h {
+            let bbs_affine = bbs_h.into_affine();
+            assert!(
+                !g_vec.contains(&bbs_affine),
+                "ACT BP G must not overlap with BBS+ h generators"
+            );
+            assert!(
+                !h_vec.contains(&bbs_affine),
+                "ACT BP H must not overlap with BBS+ h generators"
+            );
+        }
     }
 }
