@@ -15,7 +15,7 @@ use ark_bls12_381::{G1Projective, G2Projective};
 use ark_ec::{CurveGroup, VariableBaseMSM, pairing::Pairing};
 use ark_ff::{Field, PrimeField};
 use ark_serialize::CanonicalSerialize;
-use ark_std::rand::RngCore;
+use ark_std::rand::{CryptoRng, RngCore};
 use ark_std::Zero;
 use crate::bbs_proof::{BbsProof, BbsProofContext, BbsSignature};
 use crate::bulletproofs::{prove_range, serialize_proof, verify_range, RangeProof};
@@ -153,7 +153,7 @@ impl RefreshProver {
     /// finalization.
     #[allow(clippy::too_many_arguments)]
     pub fn prove(
-        rng: &mut impl RngCore,
+        rng: &mut (impl CryptoRng + RngCore),
         master: &BbsSignature,
         k_sub: Scalar,
         c_max: u32,

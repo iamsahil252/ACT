@@ -1,46 +1,50 @@
 //! Bulletproof-style range-proof helpers using `ark-bulletproofs`.
 //!
-//! This module implements real zero‑knowledge range proofs for 32‑bit values,
-//! using the specified generators `(value_base, blinding_base)`.
-//! The proofs are bound to the outer protocol transcript via a hash of the
-//! extra data, which is included in the proof’s transcript.
+//! This module implements real zero-knowledge range proofs for 32-bit values,
+//! using the R1CS interface of `ark-bulletproofs` with BLS12-381 G1.
+//!
+//! The prover and verifier share identical gadget logic (`range_proof_gadget_*`)
+//! so transcript state cannot drift between them.
 
 extern crate alloc;
 use alloc::vec::Vec;
-use ark_bls12_381::{Fr, G1Projective};
+use ark_bls12_381::{Fr, G1Affine, G1Projective};
 use ark_ec::CurveGroup;
-use ark_ff::{Field, PrimeField};
-use ark_std::rand::RngCore;
-use ark_std::Zero;
+use ark_ff::One;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_std::rand::{CryptoRng, RngCore};
 use sha2::{Digest, Sha256};
 
 use ark_bulletproofs::{
-    r1cs::{
-        ConstraintSystem, LinearCombination, Variable,
-    },
-    BulletproofGens, PedersenGens, RangeProof as ArkRangeProof,
+    r1cs::{ConstraintSystem, LinearCombination, Prover, R1CSProof, Variable, Verifier},
+    BulletproofGens, PedersenGens,
 };
-use ark_std::cfg_into_iter::IntoIterator;
+use merlin::Transcript;
 
 use crate::error::{ActError, Result};
 use crate::types::Scalar;
 
+/// Number of BulletproofGens to allocate.
+/// 64 generators is sufficient for a 32-multiplier (32-bit) R1CS range proof.
+const BP_GENS_CAPACITY: usize = 64;
+
 /// Lightweight wrapper for a Bulletproof range proof.
-/// Contains the serialised proof and a commitment binding tag.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangeProof {
-    /// Serialised Bulletproof (variable length)
+    /// Serialised R1CS proof bytes.
     pub proof_bytes: Vec<u8>,
-    /// Bit length (must be 32 for ACT)
+    /// Bit length (must be 32 for ACT).
     pub bits: u32,
-    /// Hash of the extra transcript data to bind the proof to the outer context.
+    /// Binding tag: SHA-256 hash of the outer-proof extra transcript data.
     pub transcript_tag: [u8; 32],
 }
 
 /// Generate a real Bulletproof range proof that `value < 2^bits`.
-/// Uses the given `value_base` and `blinding_base` as Pedersen generators.
+///
+/// Returns the proof together with the Pedersen commitment
+/// `commitment = value * value_base + blinding * blinding_base`.
 pub fn prove_range(
-    rng: &mut impl RngCore,
+    rng: &mut (impl CryptoRng + RngCore),
     value: u64,
     blinding: Scalar,
     bits: usize,
@@ -50,40 +54,51 @@ pub fn prove_range(
     extra_transcript_data: &[u8],
 ) -> Result<(RangeProof, G1Projective)> {
     if bits != 32 {
-        return Err(ActError::ProtocolError("ACT uses exactly 32-bit range proofs".into()));
+        return Err(ActError::ProtocolError(
+            "ACT uses exactly 32-bit range proofs".into(),
+        ));
     }
     if value >= (1u64 << bits) {
         return Err(ActError::VerificationFailed("value exceeds range".into()));
     }
 
-    // Compute commitment C = value * value_base + blinding * blinding_base
-    let commitment = value_base * Fr::from(value) + blinding_base * blinding.0;
-
-    // Build custom Pedersen generators from the provided bases.
-    let pedersen_gens = PedersenGens {
+    let pc_gens = PedersenGens::<G1Affine> {
         B: value_base.into_affine(),
         B_blinding: blinding_base.into_affine(),
     };
+    let bp_gens = BulletproofGens::<G1Affine>::new(BP_GENS_CAPACITY, 1);
 
-    let bp_gens = BulletproofGens::new(bits, 1);
-    let mut transcript = ark_bulletproofs::Transcript::new(b"ACT:RangeProof");
-    // Bind the outer context into the transcript
+    let mut transcript = Transcript::new(b"ACT:RangeProof");
     transcript.append_message(b"label", transcript_label);
     transcript.append_message(b"extra", extra_transcript_data);
 
-    let proof = ArkRangeProof::prove_single(
-        rng,
-        &bp_gens,
-        &pedersen_gens,
-        &mut transcript,
+    let mut prover = Prover::<G1Affine, &mut Transcript>::new(&pc_gens, &mut transcript);
+
+    // Commit to value; prover.commit returns the affine commitment point.
+    let (commitment_affine, v_var) = prover.commit(Fr::from(value), blinding.0);
+
+    // Bit-decomposition range check.
+    range_proof_gadget_prover(&mut prover, v_var, value, bits)
+        .map_err(|e| ActError::ProtocolError(alloc::format!("R1CS prover error: {:?}", e)))?;
+
+    let r1cs_proof = prover
+        .prove(rng, &bp_gens)
+        .map_err(|e| ActError::ProtocolError(alloc::format!("Bulletproof prove error: {:?}", e)))?;
+
+    let mut proof_bytes = Vec::new();
+    r1cs_proof
+        .serialize_compressed(&mut proof_bytes)
+        .map_err(ActError::SerializationError)?;
+
+    let transcript_tag = compute_transcript_tag(
+        transcript_label,
+        extra_transcript_data,
         value,
-        &blinding.0,
-        bits,
-    ).map_err(|e| ActError::ProtocolError(format!("Bulletproof generation failed: {:?}", e)))?;
+        blinding,
+        bits as u32,
+    );
 
-    let proof_bytes = proof.to_bytes();
-    let transcript_tag = compute_transcript_tag(transcript_label, extra_transcript_data, value, blinding, bits as u32);
-
+    let commitment: G1Projective = commitment_affine.into();
     Ok((
         RangeProof {
             proof_bytes,
@@ -94,7 +109,7 @@ pub fn prove_range(
     ))
 }
 
-/// Verify a real Bulletproof range proof.
+/// Verify a Bulletproof range proof.
 pub fn verify_range(
     proof: &RangeProof,
     commitment: G1Projective,
@@ -105,38 +120,50 @@ pub fn verify_range(
     extra_transcript_data: &[u8],
 ) -> Result<()> {
     if bits as u32 != proof.bits {
-        return Err(ActError::VerificationFailed("range bit-length mismatch".into()));
+        return Err(ActError::VerificationFailed(
+            "range bit-length mismatch".into(),
+        ));
     }
     if bits != 32 {
-        return Err(ActError::ProtocolError("ACT uses exactly 32-bit range proofs".into()));
+        return Err(ActError::ProtocolError(
+            "ACT uses exactly 32-bit range proofs".into(),
+        ));
     }
 
-    let pedersen_gens = PedersenGens {
+    let pc_gens = PedersenGens::<G1Affine> {
         B: value_base.into_affine(),
         B_blinding: blinding_base.into_affine(),
     };
-    let bp_gens = BulletproofGens::new(bits, 1);
-    let mut transcript = ark_bulletproofs::Transcript::new(b"ACT:RangeProof");
+    let bp_gens = BulletproofGens::<G1Affine>::new(BP_GENS_CAPACITY, 1);
+
+    let mut transcript = Transcript::new(b"ACT:RangeProof");
     transcript.append_message(b"label", transcript_label);
     transcript.append_message(b"extra", extra_transcript_data);
 
-    let proof_obj = ArkRangeProof::from_bytes(&proof.proof_bytes)
+    let mut verifier = Verifier::<G1Affine, &mut Transcript>::new(&mut transcript);
+
+    // Feed the commitment into the verifier's transcript.
+    let v_var = verifier.commit(commitment.into_affine());
+
+    // Identical bit-decomposition gadget; no witness values needed.
+    range_proof_gadget_verifier(&mut verifier, v_var, bits)
+        .map_err(|e| ActError::VerificationFailed(alloc::format!("R1CS verifier error: {:?}", e)))?;
+
+    let r1cs_proof = R1CSProof::<G1Affine>::deserialize_compressed(&proof.proof_bytes[..])
         .map_err(|_| ActError::VerificationFailed("invalid Bulletproof bytes".into()))?;
 
-    proof_obj.verify_single(
-        &bp_gens,
-        &pedersen_gens,
-        &mut transcript,
-        &commitment.into_affine(),
-        bits,
-    ).map_err(|e| ActError::VerificationFailed(format!("Bulletproof verification failed: {:?}", e)))?;
+    verifier
+        .verify(&r1cs_proof, &pc_gens, &bp_gens)
+        .map_err(|e| {
+            ActError::VerificationFailed(alloc::format!("Bulletproof verify failed: {:?}", e))
+        })?;
 
     Ok(())
 }
 
-/// Serialise a range proof to bytes (for inclusion in Fiat‑Shamir challenges).
+/// Serialise a range proof to bytes (for inclusion in Fiat-Shamir challenges).
 pub fn serialize_proof(proof: &RangeProof) -> Result<Vec<u8>> {
-    // Format: [bits:4][tag:32][proof_len:4][proof_bytes...]
+    // Format: [bits:4 LE][tag:32][proof_len:4 LE][proof_bytes...]
     let mut buf = Vec::new();
     buf.extend_from_slice(&proof.bits.to_le_bytes());
     buf.extend_from_slice(&proof.transcript_tag);
@@ -148,7 +175,9 @@ pub fn serialize_proof(proof: &RangeProof) -> Result<Vec<u8>> {
 /// Deserialise a range proof from bytes.
 pub fn deserialize_proof(data: &[u8]) -> Result<RangeProof> {
     if data.len() < 4 + 32 + 4 {
-        return Err(ActError::SerializationError(ark_serialize::SerializationError::InvalidData));
+        return Err(ActError::SerializationError(
+            ark_serialize::SerializationError::InvalidData,
+        ));
     }
     let mut bits_bytes = [0u8; 4];
     bits_bytes.copy_from_slice(&data[0..4]);
@@ -159,7 +188,9 @@ pub fn deserialize_proof(data: &[u8]) -> Result<RangeProof> {
     len_bytes.copy_from_slice(&data[36..40]);
     let proof_len = u32::from_le_bytes(len_bytes) as usize;
     if data.len() != 40 + proof_len {
-        return Err(ActError::SerializationError(ark_serialize::SerializationError::InvalidData));
+        return Err(ActError::SerializationError(
+            ark_serialize::SerializationError::InvalidData,
+        ));
     }
     let proof_bytes = data[40..].to_vec();
     Ok(RangeProof {
@@ -169,6 +200,81 @@ pub fn deserialize_proof(data: &[u8]) -> Result<RangeProof> {
     })
 }
 
+// ============================================================================
+// Internal gadget: bit-decomposition range check
+// ============================================================================
+
+/// Prover-side range-check gadget.
+///
+/// Proves that the committed variable `v_var` equals `value` and that
+/// `0 <= value < 2^n_bits` by decomposing `value` into `n_bits` bits.
+///
+/// For each bit index `i`:
+///   - Allocate multiplier `(b_l, b_r, b_o)` with `b_l = bit_i`, `b_r = 1-bit_i`.
+///   - Constrain `b_l + b_r = 1`   (b_r is the complement of b_l).
+///   - Constrain `b_o = 0`          (product is zero, so b_l is a bit).
+/// Then constrain `v_var = sum(b_l_i * 2^i)`.
+fn range_proof_gadget_prover<CS: ConstraintSystem<Fr>>(
+    cs: &mut CS,
+    v_var: Variable<Fr>,
+    value: u64,
+    n_bits: usize,
+) -> core::result::Result<(), ark_bulletproofs::r1cs::R1CSError> {
+    let mut bit_sum: LinearCombination<Fr> = LinearCombination::default();
+    let mut pow2 = Fr::one();
+
+    for i in 0..n_bits {
+        let bit_val = ((value >> i) & 1) as u64;
+        let bit_fr = Fr::from(bit_val);
+        let one_minus_bit = Fr::one() - bit_fr;
+
+        // l = b_i, r = 1 - b_i; implicit constraint: l * r = o.
+        let (b_l, b_r, b_o) = cs.allocate_multiplier(Some((bit_fr, one_minus_bit)))?;
+
+        // Explicit: b_l + b_r - 1 = 0.
+        cs.constrain(b_l + b_r - Variable::One());
+        // Explicit: b_o = 0 (ensures b_l is a bit).
+        cs.constrain(LinearCombination::from(b_o));
+
+        // Accumulate: bit_sum += b_l * 2^i.
+        bit_sum = bit_sum + b_l * pow2;
+        pow2 = pow2 + pow2;
+    }
+
+    // v = sum(b_i * 2^i).
+    cs.constrain(LinearCombination::from(v_var) - bit_sum);
+
+    Ok(())
+}
+
+/// Verifier-side range-check gadget.
+///
+/// Structurally identical to `range_proof_gadget_prover` but without witness
+/// values (`None` passed to `allocate_multiplier`).
+fn range_proof_gadget_verifier<CS: ConstraintSystem<Fr>>(
+    cs: &mut CS,
+    v_var: Variable<Fr>,
+    n_bits: usize,
+) -> core::result::Result<(), ark_bulletproofs::r1cs::R1CSError> {
+    let mut bit_sum: LinearCombination<Fr> = LinearCombination::default();
+    let mut pow2 = Fr::one();
+
+    for _ in 0..n_bits {
+        let (b_l, b_r, b_o) = cs.allocate_multiplier(None)?;
+
+        cs.constrain(b_l + b_r - Variable::One());
+        cs.constrain(LinearCombination::from(b_o));
+
+        bit_sum = bit_sum + b_l * pow2;
+        pow2 = pow2 + pow2;
+    }
+
+    cs.constrain(LinearCombination::from(v_var) - bit_sum);
+
+    Ok(())
+}
+
+/// Compute the binding tag for the range proof.
 fn compute_transcript_tag(
     label: &[u8],
     extra: &[u8],
@@ -185,6 +291,10 @@ fn compute_transcript_tag(
     hasher.update(bits.to_le_bytes());
     hasher.finalize().into()
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -213,7 +323,8 @@ mod tests {
             blinding_base,
             b"ACT:Test",
             extra,
-        ).unwrap();
+        )
+        .unwrap();
 
         verify_range(
             &proof,
@@ -223,13 +334,61 @@ mod tests {
             blinding_base,
             b"ACT:Test",
             extra,
-        ).unwrap();
+        )
+        .unwrap();
 
-        // Serialization roundtrip
+        // Serialization roundtrip.
         let bytes = serialize_proof(&proof).unwrap();
         let proof2 = deserialize_proof(&bytes).unwrap();
         assert_eq!(proof.bits, proof2.bits);
         assert_eq!(proof.transcript_tag, proof2.transcript_tag);
         assert_eq!(proof.proof_bytes, proof2.proof_bytes);
+    }
+
+    #[test]
+    fn range_proof_wrong_commitment_fails() {
+        let mut rng = thread_rng();
+        let gens = Generators::new();
+
+        let value = 100u64;
+        let blinding = Scalar::rand(&mut rng);
+        let extra = b"extra";
+
+        let (proof, _commitment) = prove_range(
+            &mut rng,
+            value,
+            blinding,
+            32,
+            gens.h[4],
+            gens.h[0],
+            b"ACT:Test",
+            extra,
+        )
+        .unwrap();
+
+        // Use a different commitment (for a different value).
+        let wrong_blinding = Scalar::rand(&mut rng);
+        let wrong_commitment =
+            gens.h[4] * ark_bls12_381::Fr::from(999u64) + gens.h[0] * wrong_blinding.0;
+
+        let result = verify_range(
+            &proof,
+            wrong_commitment,
+            32,
+            gens.h[4],
+            gens.h[0],
+            b"ACT:Test",
+            extra,
+        );
+        assert!(result.is_err(), "verification must fail for wrong commitment");
+    }
+
+    #[test]
+    fn transcript_scalar_uses_fixed_width_bytes() {
+        // Verify that k_cur.to_bytes() always returns exactly 32 bytes.
+        let mut rng = thread_rng();
+        let k_cur = Scalar::rand(&mut rng);
+        let bytes = k_cur.to_bytes();
+        assert_eq!(bytes.len(), 32, "Scalar::to_bytes must return exactly 32 bytes");
     }
 }

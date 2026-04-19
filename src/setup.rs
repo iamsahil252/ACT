@@ -33,7 +33,9 @@ impl Generators {
         let dst = b"ACT:BBS:";
         let mut h = [G1Projective::zero(); 5];
         for (i, elem) in h.iter_mut().enumerate() {
-            let msg = [dst.as_slice(), &[i as u8]].concat();
+            // I2OSP(i, 4): 4-byte big-endian index. The DST is passed as the
+            // first argument to hash_to_g1 and must NOT be repeated in msg.
+            let msg = (i as u32).to_be_bytes();
             *elem = hash_to_g1(dst, &msg);
         }
         Self { g1, g2, h }
@@ -100,6 +102,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn generators_are_deterministic() {
+        let gens1 = Generators::new();
+        let gens2 = Generators::new();
+        for i in 0..5 {
+            assert_eq!(gens1.h[i], gens2.h[i], "generator h[{i}] must be deterministic");
+        }
+    }
+
+    #[test]
+    fn generator_dst_not_in_message() {
+        // Ensure generators are derived as hash_to_g1(dst, I2OSP(i)) and NOT
+        // as hash_to_g1(dst, dst || I2OSP(i)).  We verify by checking the actual
+        // output is consistent with the fixed derivation.
+        let gens = Generators::new();
+        let expected_h0 = hash_to_g1(b"ACT:BBS:", &0u32.to_be_bytes());
+        let expected_h4 = hash_to_g1(b"ACT:BBS:", &4u32.to_be_bytes());
+        assert_eq!(gens.h[0], expected_h0, "h[0] derivation mismatch");
+        assert_eq!(gens.h[4], expected_h4, "h[4] derivation mismatch");
     }
 
     #[test]

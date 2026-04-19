@@ -16,9 +16,9 @@ use alloc::vec::Vec;
 use ark_std::vec;
 use ark_bls12_381::{G1Projective, G2Projective};
 use ark_ec::{CurveGroup, VariableBaseMSM, pairing::Pairing};
-use ark_ff::{BigInteger, Field, PrimeField};
+use ark_ff::{Field, PrimeField};
 use ark_serialize::CanonicalSerialize;
-use ark_std::rand::RngCore;
+use ark_std::rand::{CryptoRng, RngCore};
 use ark_std::Zero;
 use crate::bbs_proof::{BbsProof, BbsProofContext, BbsSignature};
 use crate::bulletproofs::{prove_range, serialize_proof, verify_range, RangeProof};
@@ -130,7 +130,7 @@ impl SpendProver {
     /// Generate the spend proof and return the client state.
     #[allow(clippy::too_many_arguments)]
     pub fn prove(
-        rng: &mut impl RngCore,
+        rng: &mut (impl CryptoRng + RngCore),
         token: &BbsSignature,
         k_cur: Scalar,
         c_bal: u32,
@@ -253,7 +253,7 @@ impl SpendProver {
         let mut bp_extra = Vec::new();
         bp_extra.extend_from_slice(&h_ctx.to_bytes());
         bp_extra.extend_from_slice(&spend_amount.to_le_bytes());
-        bp_extra.extend_from_slice(&k_cur.0.into_bigint().to_bytes_le());
+        bp_extra.extend_from_slice(&k_cur.to_bytes());
         bp_extra.extend_from_slice(&t_issue.to_le_bytes());
         bp_extra.extend_from_slice(nonce);
         k_prime.serialize_compressed(&mut bp_extra).unwrap();
@@ -278,7 +278,7 @@ impl SpendProver {
         preimage.extend_from_slice(&h_ctx.to_bytes());
         pk_daily.serialize_compressed(&mut preimage).unwrap();
         preimage.extend_from_slice(&spend_amount.to_le_bytes());
-        preimage.extend_from_slice(&k_cur.0.into_bigint().to_bytes_le());
+        preimage.extend_from_slice(&k_cur.to_bytes());
         preimage.extend_from_slice(&t_issue.to_le_bytes());
         preimage.extend_from_slice(nonce);
         k_prime.serialize_compressed(&mut preimage).unwrap();
@@ -383,7 +383,7 @@ pub fn verify_spend(
     preimage.extend_from_slice(&h_ctx.to_bytes());
     pk_daily.serialize_compressed(&mut preimage).unwrap();
     preimage.extend_from_slice(&proof.s.to_le_bytes());
-    preimage.extend_from_slice(&proof.k_cur.0.into_bigint().to_bytes_le());
+    preimage.extend_from_slice(&proof.k_cur.to_bytes());
     preimage.extend_from_slice(&proof.t_issue.to_le_bytes());
     preimage.extend_from_slice(nonce);
     proof.k_prime.serialize_compressed(&mut preimage).unwrap();
@@ -465,7 +465,7 @@ pub fn verify_spend(
     let mut bp_extra = Vec::new();
     bp_extra.extend_from_slice(&h_ctx.to_bytes());
     bp_extra.extend_from_slice(&proof.s.to_le_bytes());
-    bp_extra.extend_from_slice(&proof.k_cur.0.into_bigint().to_bytes_le());
+    bp_extra.extend_from_slice(&proof.k_cur.to_bytes());
     bp_extra.extend_from_slice(&proof.t_issue.to_le_bytes());
     bp_extra.extend_from_slice(nonce);
     proof.k_prime.serialize_compressed(&mut bp_extra).unwrap();
