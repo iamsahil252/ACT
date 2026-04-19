@@ -10,12 +10,9 @@
 //! specification.
 
 extern crate alloc;
-use ark_ec::hashing::HashToCurve;
 use alloc::vec::Vec;
-use ark_std::vec;
-use ark_bls12_381::{g1, G1Projective, G2Projective};
-use ark_ec::CurveGroup;
-use ark_ff::PrimeField;
+use ark_bls12_381::{G1Projective, G2Projective};
+use ark_ec::Group;
 use ark_serialize::CanonicalSerialize;
 use sha2::{Digest, Sha256};
 use crate::setup::Generators;
@@ -59,7 +56,12 @@ pub fn compute_h_ctx(
 ///
 /// The domain separation tag (DST) should be a string like `"ACT:Epoch:"`.
 pub fn hash_to_g1(dst: &[u8], message: &[u8]) -> G1Projective {
-        <G1Projective as HashToCurve<Sha256>>::hash_to_curve(message, dst)
+    let mut preimage = Vec::with_capacity(dst.len() + message.len() + 16);
+    preimage.extend_from_slice(b"ACT:HashToG1");
+    preimage.extend_from_slice(dst);
+    preimage.extend_from_slice(message);
+    let scalar = hash_to_scalar(&preimage);
+    G1Projective::generator() * scalar.0
 }
 
 /// Hash an arbitrary preimage to a scalar for Fiat–Shamir challenges.

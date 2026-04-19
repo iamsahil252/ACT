@@ -47,11 +47,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
-#![cfg_attr(not(feature = "std"), no_std)]
 #[cfg(feature = "std")]
 extern crate std;
-
-extern crate alloc;
 // Re-export arkworks types for convenience
 pub use ark_bls12_381::{Fr, G1Projective, G2Projective};
 pub use ark_ec::CurveGroup;
@@ -63,12 +60,17 @@ pub mod types;
 pub mod hash;
 pub mod setup;
 pub mod commitments;
+#[cfg(feature = "std")]
 pub mod bbs_proof;
+#[cfg(feature = "std")]
 pub mod bulletproofs;
 
 // Protocol phases
+#[cfg(feature = "std")]
 pub mod master_mint;
+#[cfg(feature = "std")]
 pub mod epoch_refresh;
+#[cfg(feature = "std")]
 pub mod spend;
 
 // Server components (feature-gated)
@@ -79,11 +81,15 @@ pub mod server;
 pub use error::{ActError, Result};
 pub use types::{CompressedG1, CompressedG2, Scalar, HexScalar, HexG1, HexG2};
 pub use setup::{Generators, ServerKeys};
+#[cfg(feature = "std")]
 pub use bbs_proof::{BbsProof, BbsSignature};
 pub use hash::{compute_h_ctx, hash_to_g1, hash_to_scalar};
 pub use commitments::{commit, verify_bridge, verify_bridge_single_base};
+#[cfg(feature = "std")]
 pub use master_mint::{MasterMintClient, MasterMintRequest, MasterMintServer, ProofOfKnowledge};
+#[cfg(feature = "std")]
 pub use epoch_refresh::{RefreshProof, RefreshResponse, RefreshProver, verify_refresh};
+#[cfg(feature = "std")]
 pub use spend::{SpendProof, SpendResponse, SpendProver, verify_spend};
 
 /// The current version of the ACT protocol implementation.
@@ -96,9 +102,11 @@ pub const MESSAGE_GENERATOR_COUNT: usize = 3;
 pub const RANGE_PROOF_BITS: usize = 32;
 
 #[cfg(test)]
+#[cfg(feature = "std")]
 mod tests {
     use super::*;
     use ark_std::rand::thread_rng;
+    use ark_std::Zero;
 
     #[test]
     fn end_to_end_flow() {
@@ -112,8 +120,8 @@ mod tests {
         let (a_sub, e_sub, s_prime) = MasterMintServer::issue(
             &mut rng, &mint_req, 100, 5000, &generators, &keys, h_ctx
         ).unwrap();
-        let master_sig = mint_client.finalize(a_sub, e_sub, s_prime);
         let k_sub = mint_client.k_sub;
+        let master_sig = mint_client.finalize(a_sub, e_sub, s_prime);
 
         // 2. Epoch Refresh
         let current_epoch = 1000u32;

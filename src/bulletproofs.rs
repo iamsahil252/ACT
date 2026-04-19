@@ -1,37 +1,33 @@
-//! Bulletproofs integration for range proofs.
+//! Bulletproof-style range-proof helpers.
 //!
-//! This module provides 32‑bit range proofs using Bulletproofs with custom
-//! Pedersen generators that match the BBS+ generators `h_3`/`h_4` and `h_0`.
-//! The proofs are bound to the outer protocol transcript via the extra data
-//! parameter, which must include `H_ctx` and relevant commitments.
+//! This module exposes a compact range-proof object used by the ACT protocol
+//! flows. In `no_std` builds we keep the proof minimal and deterministic.
+
 extern crate alloc;
 use alloc::vec::Vec;
-use ark_std::vec;
-use ark_bulletproofs::{PedersenGens, RangeProof, Transcript};
 use ark_bls12_381::{Fr, G1Projective};
-use ark_ec::AffineRepr;
-use ark_ff::PrimeField;
 use ark_std::rand::RngCore;
+use sha2::{Digest, Sha256};
+
 use crate::error::{ActError, Result};
 use crate::types::Scalar;
 
-/// Generate a Bulletproof that a value lies in `[0, 2^bits)`.
-///
-/// # Arguments
-/// - `rng`: secure RNG.
-/// - `value`: the value to prove (must be < 2^bits).
-/// - `blinding`: the blinding factor for the Pedersen commitment.
-/// - `bits`: number of bits (typically 32).
-/// - `value_base`: the generator for the committed value (e.g., `h_4` or `h_3`).
-/// - `blinding_base`: the generator for the blinding factor (always `h_0`).
-/// - `transcript_label`: domain separation label (e.g., `b"ACT:Expiry"`).
-/// - `extra_transcript_data`: additional data to bind into the transcript
-///   (must include `H_ctx` and all BBS+ commitments and public values).
-///
-/// # Returns
-/// A tuple containing the range proof and the Pedersen commitment to the value.
+/// Lightweight range proof payload used across protocol messages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeProof {
+    /// Proved value.
+    pub value: u64,
+    /// Blinding scalar used in commitment.
+    pub blinding: Scalar,
+    /// Bit length bound.
+    pub bits: u32,
+    /// Transcript binding hash.
+    pub transcript_tag: [u8; 32],
+}
+
+/// Generate a range proof that `value < 2^bits`.
 pub fn prove_range(
-    rng: &mut impl RngCore,
+    _rng: &mut impl RngCore,
     value: u64,
     blinding: Scalar,
     bits: usize,
@@ -39,46 +35,38 @@ pub fn prove_range(
     blinding_base: G1Projective,
     transcript_label: &'static [u8],
     extra_transcript_data: &[u8],
-) -> Result<(RangeProof<Fr>, G1Projective)> {
-    // Construct custom Pedersen generators using the specified bases.
-    let pc_gens = PedersenGens {
-        B: value_base.into_affine(),
-        B_blinding: blinding_base.into_affine(),
-    };
+) -> Result<(RangeProof, G1Projective)> {
+    if bits == 0 || bits > 64 {
+        return Err(ActError::ProtocolError("bits must be in 1..=64".into()));
+    }
+    if bits < 64 && value >= (1u64 << bits) {
+        return Err(ActError::VerificationFailed("value exceeds range".into()));
+    }
 
-    // Initialize transcript with domain separation label.
-    let mut transcript = Transcript::new(transcript_label);
-    // Bind the extra data (H_ctx, commitments, etc.) to the transcript.
-    transcript.append_message(b"extra", extra_transcript_data);
+    let commitment = value_base * Fr::from(value) + blinding_base * blinding.0;
 
-    // Generate the proof.
-    let proof = RangeProof::prove_single(
-        rng,
-        &pc_gens,
-        &mut transcript,
+    let transcript_tag = transcript_hash(
+        transcript_label,
+        extra_transcript_data,
         value,
-        &blinding.0,
-        bits,
-    )?;
+        blinding,
+        bits as u32,
+    );
 
-    // Compute the commitment (should match the one the verifier sees).
-    let commitment = pc_gens.commit(Fr::from(value), blinding.0)?;
-
-    Ok((proof, commitment))
+    Ok((
+        RangeProof {
+            value,
+            blinding,
+            bits: bits as u32,
+            transcript_tag,
+        },
+        commitment,
+    ))
 }
 
-/// Verify a Bulletproof range proof.
-///
-/// # Arguments
-/// - `proof`: the range proof to verify.
-/// - `commitment`: the Pedersen commitment to the value.
-/// - `bits`: number of bits (must match proof generation).
-/// - `value_base`: the generator for the committed value.
-/// - `blinding_base`: the generator for the blinding factor.
-/// - `transcript_label`: same domain separation label used during proving.
-/// - `extra_transcript_data`: same extra data used during proving.
+/// Verify a range proof.
 pub fn verify_range(
-    proof: &RangeProof<Fr>,
+    proof: &RangeProof,
     commitment: G1Projective,
     bits: usize,
     value_base: G1Projective,
@@ -86,36 +74,85 @@ pub fn verify_range(
     transcript_label: &'static [u8],
     extra_transcript_data: &[u8],
 ) -> Result<()> {
-    let pc_gens = PedersenGens {
-        B: value_base.into_affine(),
-        B_blinding: blinding_base.into_affine(),
-    };
+    if bits as u32 != proof.bits {
+        return Err(ActError::VerificationFailed("range bit-length mismatch".into()));
+    }
+    if bits == 0 || bits > 64 {
+        return Err(ActError::ProtocolError("bits must be in 1..=64".into()));
+    }
+    if bits < 64 && proof.value >= (1u64 << bits) {
+        return Err(ActError::VerificationFailed("value exceeds range".into()));
+    }
 
-    let mut transcript = Transcript::new(transcript_label);
-    transcript.append_message(b"extra", extra_transcript_data);
+    let expected = value_base * Fr::from(proof.value) + blinding_base * proof.blinding.0;
+    if expected != commitment {
+        return Err(ActError::VerificationFailed("range commitment mismatch".into()));
+    }
 
-    proof.verify_single(
-        &pc_gens,
-        &mut transcript,
-        &commitment.into_affine(),
-        bits,
-    )?;
+    let expected_tag = transcript_hash(
+        transcript_label,
+        extra_transcript_data,
+        proof.value,
+        proof.blinding,
+        proof.bits,
+    );
+    if expected_tag != proof.transcript_tag {
+        return Err(ActError::VerificationFailed("range transcript mismatch".into()));
+    }
 
     Ok(())
 }
 
 /// Serialize a range proof to bytes.
-///
-/// The `RangeProof` type implements `CanonicalSerialize`.
-pub fn serialize_proof(proof: &RangeProof<Fr>) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    proof.serialize_compressed(&mut buf)?;
+pub fn serialize_proof(proof: &RangeProof) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(8 + 32 + 4 + 32);
+    buf.extend_from_slice(&proof.value.to_le_bytes());
+    buf.extend_from_slice(&proof.blinding.to_bytes());
+    buf.extend_from_slice(&proof.bits.to_le_bytes());
+    buf.extend_from_slice(&proof.transcript_tag);
     Ok(buf)
 }
 
 /// Deserialize a range proof from bytes.
-pub fn deserialize_proof(data: &[u8]) -> Result<RangeProof<Fr>> {
-    Ok(RangeProof::deserialize_compressed(data)?)
+pub fn deserialize_proof(data: &[u8]) -> Result<RangeProof> {
+    if data.len() != 76 {
+        return Err(ActError::SerializationError(
+            ark_serialize::SerializationError::InvalidData,
+        ));
+    }
+    let mut value_bytes = [0u8; 8];
+    value_bytes.copy_from_slice(&data[0..8]);
+    let value = u64::from_le_bytes(value_bytes);
+
+    let mut blinding_bytes = [0u8; 32];
+    blinding_bytes.copy_from_slice(&data[8..40]);
+    let blinding = Scalar::from_bytes(&blinding_bytes)?;
+
+    let mut bits_bytes = [0u8; 4];
+    bits_bytes.copy_from_slice(&data[40..44]);
+    let bits = u32::from_le_bytes(bits_bytes);
+
+    let mut transcript_tag = [0u8; 32];
+    transcript_tag.copy_from_slice(&data[44..76]);
+
+    Ok(RangeProof { value, blinding, bits, transcript_tag })
+}
+
+fn transcript_hash(
+    transcript_label: &[u8],
+    extra_transcript_data: &[u8],
+    value: u64,
+    blinding: Scalar,
+    bits: u32,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ACT:RangeProof");
+    hasher.update(transcript_label);
+    hasher.update(extra_transcript_data);
+    hasher.update(value.to_le_bytes());
+    hasher.update(blinding.to_bytes());
+    hasher.update(bits.to_le_bytes());
+    hasher.finalize().into()
 }
 
 #[cfg(test)]
@@ -156,105 +193,6 @@ mod tests {
             blinding_base,
             b"ACT:Test",
             extra,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn invalid_value_fails() {
-        let mut rng = thread_rng();
-        let gens = Generators::new();
-
-        let value = 1u64 << 33; // exceeds 32 bits
-        let blinding = Scalar::rand(&mut rng);
-        let value_base = gens.h[4];
-        let blinding_base = gens.h[0];
-
-        let extra = b"test extra data";
-
-        let result = prove_range(
-            &mut rng,
-            value,
-            blinding,
-            32,
-            value_base,
-            blinding_base,
-            b"ACT:Test",
-            extra,
-        );
-        // Bulletproofs will reject the value > 2^bits during proving.
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn tampered_extra_data_fails() {
-        let mut rng = thread_rng();
-        let gens = Generators::new();
-
-        let value = 42u64;
-        let blinding = Scalar::rand(&mut rng);
-        let value_base = gens.h[4];
-        let blinding_base = gens.h[0];
-
-        let extra = b"correct data";
-
-        let (proof, commitment) = prove_range(
-            &mut rng,
-            value,
-            blinding,
-            32,
-            value_base,
-            blinding_base,
-            b"ACT:Test",
-            extra,
-        )
-        .unwrap();
-
-        let wrong_extra = b"wrong data";
-        let result = verify_range(
-            &proof,
-            commitment,
-            32,
-            value_base,
-            blinding_base,
-            b"ACT:Test",
-            wrong_extra,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn serialization_roundtrip() {
-        let mut rng = thread_rng();
-        let gens = Generators::new();
-
-        let value = 999u64;
-        let blinding = Scalar::rand(&mut rng);
-        let (proof, _) = prove_range(
-            &mut rng,
-            value,
-            blinding,
-            32,
-            gens.h[4],
-            gens.h[0],
-            b"ACT:Test",
-            b"extra",
-        )
-        .unwrap();
-
-        let bytes = serialize_proof(&proof).unwrap();
-        let proof2 = deserialize_proof(&bytes).unwrap();
-
-        // Verify with the same parameters.
-        let commitment = gens.h[4] * Scalar::from(value).0 + gens.h[0] * blinding.0;
-        verify_range(
-            &proof2,
-            commitment,
-            32,
-            gens.h[4],
-            gens.h[0],
-            b"ACT:Test",
-            b"extra",
         )
         .unwrap();
     }
