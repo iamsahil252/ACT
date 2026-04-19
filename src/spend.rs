@@ -22,7 +22,7 @@ use ark_std::Zero;
 use sha2::Digest as _;
 use ark_std::io::Write as _;
 use crate::bbs_proof::BbsSignature;
-use crate::bulletproofs::{prove_range, serialize_proof, verify_range, RangeProof};
+use crate::batched_eq::{prove_batched_equality, verify_batched_equality, BatchedEqualityProof};
 use crate::error::{ActError, Result};
 use crate::hash::{hash_to_scalar_from_hasher, HasherWriter};
 use crate::setup::{Generators, ServerKeys};
@@ -63,8 +63,9 @@ pub struct SpendProof {
     pub z_v: Scalar,
     pub z_w: Scalar,
 
-    // Range proof for remaining balance
-    pub bp_spend: RangeProof,
+    /// Dual-curve equality proof for remaining balance, embedding the Dalek
+    /// range proof for `m ∈ [0, 2³²−1]`.
+    pub batched_eq: BatchedEqualityProof,
 
     // Public values (sent separately but included for convenience)
     pub s: u32,
@@ -279,32 +280,36 @@ impl SpendProver {
             G1Projective::msm(&bases, &scalars).expect("T_BP MSM length mismatch")
         };
 
-        // 8. Generate Bulletproof (needs BBS+ commitments in extra data)
-        let mut bp_extra = Vec::with_capacity(32 + 4 + 32 + 4 + 16 + 3 * 48);
-        bp_extra.extend_from_slice(&h_ctx.to_bytes());
-        bp_extra.extend_from_slice(&spend_amount.to_le_bytes());
-        bp_extra.extend_from_slice(&k_cur.to_bytes());
-        bp_extra.extend_from_slice(&t_issue.to_le_bytes());
-        bp_extra.extend_from_slice(nonce);
-        k_prime.serialize_compressed(&mut bp_extra).unwrap();
-        c_total.serialize_compressed(&mut bp_extra).unwrap();
-        c_bp.serialize_compressed(&mut bp_extra).unwrap();
-        a_prime.serialize_compressed(&mut bp_extra).unwrap();
-        a_bar.serialize_compressed(&mut bp_extra).unwrap();
-        t_bbs.serialize_compressed(&mut bp_extra).unwrap();
-        let (bp_spend, _) = prove_range(
+        // 8. BatchedEqualityProof: prove m in C_BP (BLS12-381) equals m in
+        //    C_25519 (Curve25519), and that m ∈ [0, 2³²−1] via Dalek Bulletproof.
+        //
+        // The context binds the proof to this specific spend session, preventing
+        // transcript-splicing attacks as required by Section 9.2.
+        let mut beq_context = Vec::new();
+        beq_context.extend_from_slice(&h_ctx.to_bytes());
+        beq_context.extend_from_slice(&spend_amount.to_le_bytes());
+        beq_context.extend_from_slice(&k_cur.to_bytes());
+        beq_context.extend_from_slice(&t_issue.to_le_bytes());
+        beq_context.extend_from_slice(nonce);
+        k_prime.serialize_compressed(&mut beq_context).unwrap();
+        c_total.serialize_compressed(&mut beq_context).unwrap();
+        a_prime.serialize_compressed(&mut beq_context).unwrap();
+        a_bar.serialize_compressed(&mut beq_context).unwrap();
+        t_bbs.serialize_compressed(&mut beq_context).unwrap();
+
+        let (batched_eq, c_bp_from_beq) = prove_batched_equality(
             rng,
-            m as u64,
-            r_bp,
-            32,
+            m,
+            r_bp.0,
             generators.h[4],
             generators.h[0],
-            b"ACT:Spend",
-            &bp_extra,
+            &beq_context,
         )?;
+        // Sanity: c_bp_from_beq must match c_bp (same m and r_bp).
+        debug_assert_eq!(c_bp, c_bp_from_beq, "c_bp mismatch");
+        let beq_bytes = batched_eq.to_bytes();
 
         // 9. Challenge — feed all elements directly into SHA-256, no intermediate Vec.
-        let bp_bytes = serialize_proof(&bp_spend).unwrap();
         let c = {
             let mut hasher = sha2::Sha256::new();
             let mut w = HasherWriter(&mut hasher);
@@ -317,7 +322,7 @@ impl SpendProver {
             k_prime.serialize_compressed(&mut w).unwrap();
             c_total.serialize_compressed(&mut w).unwrap();
             c_bp.serialize_compressed(&mut w).unwrap();
-            w.write_all(&bp_bytes).unwrap();
+            w.write_all(&beq_bytes).unwrap();
             a_prime.serialize_compressed(&mut w).unwrap();
             a_bar.serialize_compressed(&mut w).unwrap();
             t_bbs.serialize_compressed(&mut w).unwrap();
@@ -358,7 +363,7 @@ impl SpendProver {
             z_u,
             z_v,
             z_w,
-            bp_spend,
+            batched_eq,
             s: spend_amount,
             k_cur,
             t_issue,
@@ -414,7 +419,7 @@ pub fn verify_spend(
     let c_total = proof.k_prime + generators.h[4] * Scalar::from(proof.s).0;
 
     // 5. Recompute challenge — feed all elements directly into SHA-256.
-    let bp_bytes = serialize_proof(&proof.bp_spend).unwrap();
+    let beq_bytes = proof.batched_eq.to_bytes();
     let c = {
         let mut hasher = sha2::Sha256::new();
         let mut w = HasherWriter(&mut hasher);
@@ -427,7 +432,7 @@ pub fn verify_spend(
         proof.k_prime.serialize_compressed(&mut w).unwrap();
         c_total.serialize_compressed(&mut w).unwrap();
         proof.c_bp.serialize_compressed(&mut w).unwrap();
-        w.write_all(&bp_bytes).unwrap();
+        w.write_all(&beq_bytes).unwrap();
         proof.a_prime.serialize_compressed(&mut w).unwrap();
         proof.a_bar.serialize_compressed(&mut w).unwrap();
         proof.t_bbs.serialize_compressed(&mut w).unwrap();
@@ -550,27 +555,27 @@ pub fn verify_spend(
         }
     }
 
-    // 8. Bulletproof verification
-    let mut bp_extra = Vec::with_capacity(32 + 4 + 32 + 4 + 16 + 6 * 48);
-    bp_extra.extend_from_slice(&h_ctx.to_bytes());
-    bp_extra.extend_from_slice(&proof.s.to_le_bytes());
-    bp_extra.extend_from_slice(&proof.k_cur.to_bytes());
-    bp_extra.extend_from_slice(&proof.t_issue.to_le_bytes());
-    bp_extra.extend_from_slice(nonce);
-    proof.k_prime.serialize_compressed(&mut bp_extra).unwrap();
-    c_total.serialize_compressed(&mut bp_extra).unwrap();
-    proof.c_bp.serialize_compressed(&mut bp_extra).unwrap();
-    proof.a_prime.serialize_compressed(&mut bp_extra).unwrap();
-    proof.a_bar.serialize_compressed(&mut bp_extra).unwrap();
-    proof.t_bbs.serialize_compressed(&mut bp_extra).unwrap();
-    verify_range(
-        &proof.bp_spend,
+    // 8. BatchedEqualityProof verification: checks that m in C_BP (BLS12-381)
+    //    equals m in C_25519 (Curve25519), and that m ∈ [0, 2³²−1] via Dalek.
+    //
+    //    The beq_context mirrors what the prover bound into the inner challenge.
+    let mut beq_context = Vec::new();
+    beq_context.extend_from_slice(&h_ctx.to_bytes());
+    beq_context.extend_from_slice(&proof.s.to_le_bytes());
+    beq_context.extend_from_slice(&proof.k_cur.to_bytes());
+    beq_context.extend_from_slice(&proof.t_issue.to_le_bytes());
+    beq_context.extend_from_slice(nonce);
+    proof.k_prime.serialize_compressed(&mut beq_context).unwrap();
+    c_total.serialize_compressed(&mut beq_context).unwrap();
+    proof.a_prime.serialize_compressed(&mut beq_context).unwrap();
+    proof.a_bar.serialize_compressed(&mut beq_context).unwrap();
+    proof.t_bbs.serialize_compressed(&mut beq_context).unwrap();
+    verify_batched_equality(
+        &proof.batched_eq,
         proof.c_bp,
-        32,
         generators.h[4],
         generators.h[0],
-        b"ACT:Spend",
-        &bp_extra,
+        &beq_context,
     )?;
 
     // 9. Pairing check: e(A', pk_daily) == e(A_bar, g2).
