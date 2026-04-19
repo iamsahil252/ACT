@@ -10,7 +10,6 @@
 //! specification.
 
 extern crate alloc;
-use alloc::vec::Vec;
 use ark_bls12_381::{G1Projective, G2Projective};
 use ark_ec::hashing::{
     curve_maps::wb::WBMap,
@@ -43,16 +42,17 @@ pub fn compute_h_ctx(
     hasher.update(b"ACT:Context");
     hasher.update(app_id.as_bytes());
 
-    // Serialize all points in compressed form
-    let mut buf = Vec::new();
-    pk_master.serialize_compressed(&mut buf).unwrap();
-    pk_daily.serialize_compressed(&mut buf).unwrap();
-    generators.g1.serialize_compressed(&mut buf).unwrap();
-    generators.g2.serialize_compressed(&mut buf).unwrap();
-    for h in &generators.h {
-        h.serialize_compressed(&mut buf).unwrap();
+    // Serialize all points directly into the hasher (no intermediate Vec).
+    {
+        let mut w = HasherWriter(&mut hasher);
+        pk_master.serialize_compressed(&mut w).unwrap();
+        pk_daily.serialize_compressed(&mut w).unwrap();
+        generators.g1.serialize_compressed(&mut w).unwrap();
+        generators.g2.serialize_compressed(&mut w).unwrap();
+        for h in &generators.h {
+            h.serialize_compressed(&mut w).unwrap();
+        }
     }
-    hasher.update(&buf);
 
     scalar_from_hash(hasher.finalize())
 }
@@ -82,6 +82,33 @@ pub fn hash_to_g1(dst: &[u8], message: &[u8]) -> G1Projective {
 pub fn hash_to_scalar(preimage: &[u8]) -> Scalar {
     let digest = Sha256::digest(preimage);
     scalar_from_hash(digest)
+}
+
+/// An adapter that implements [`ark_std::io::Write`] by forwarding bytes into a
+/// running `sha2::Sha256` hasher.
+///
+/// This lets `CanonicalSerialize::serialize_compressed` feed bytes directly
+/// into the hasher without any intermediate heap allocation.
+pub(crate) struct HasherWriter<'a>(pub &'a mut Sha256);
+
+impl ark_std::io::Write for HasherWriter<'_> {
+    #[inline(always)]
+    fn write(&mut self, buf: &[u8]) -> ark_std::io::Result<usize> {
+        Digest::update(self.0, buf);
+        Ok(buf.len())
+    }
+    #[inline(always)]
+    fn flush(&mut self) -> ark_std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Finalise a running `sha2::Sha256` hasher and return a Fiat–Shamir scalar.
+///
+/// Use together with [`HasherWriter`] to build challenge preimages without any
+/// intermediate `Vec<u8>` allocation.
+pub(crate) fn hash_to_scalar_from_hasher(hasher: Sha256) -> Scalar {
+    scalar_from_hash(Digest::finalize(hasher))
 }
 
 /// Convert a 32‑byte hash digest to a scalar by reducing modulo the group order.

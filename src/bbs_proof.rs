@@ -16,22 +16,25 @@
 extern crate alloc;
 use alloc::format;
 use alloc::vec::Vec;
-use ark_std::vec;
-use ark_bls12_381::{Fr, G1Projective, G2Projective};
+use ark_bls12_381::{Fq12, Fr, G1Projective, G2Projective};
 use ark_ec::{pairing::Pairing, CurveGroup, VariableBaseMSM};
-use ark_ff::Zero;
+use ark_ff::{Field, Zero};
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::RngCore;
+use sha2::Digest as _;
+use ark_std::io::Write as _;
 use crate::error::{ActError, Result};
-use crate::hash::hash_to_scalar;
+use crate::hash::{hash_to_scalar_from_hasher, HasherWriter};
 use crate::setup::Generators;
 use crate::types::Scalar;
 
+/// Efficient MSM using batch affine normalization + Pippenger's algorithm.
+///
+/// Converts projective bases to affine with a single batch inversion, then
+/// delegates to `VariableBaseMSM` (Pippenger) rather than the naïve fold.
 fn msm_projective(bases: &[G1Projective], scalars: &[Fr]) -> G1Projective {
-    bases
-        .iter()
-        .zip(scalars.iter())
-        .fold(G1Projective::zero(), |acc, (b, s)| acc + (*b * *s))
+    let affine = G1Projective::normalize_batch(bases);
+    G1Projective::msm(&affine, scalars).expect("MSM length mismatch")
 }
 
 /// A BBS+ signature.
@@ -111,13 +114,19 @@ impl BbsProof {
         let a_prime = sig.a * r1.0;
 
         // Compute the message part: M = g1 * h0^s * ∏_{i=1..L} h_i^{m_i}
-        let mut bases = vec![generators.g1, generators.h[0]];
-        let mut scalars = vec![Scalar::ONE.0, sig.s.0];
+        // Use pre-cached affine generators for the static bases.
+        let mut bases_affine = Vec::with_capacity(2 + l);
+        let mut scalars: Vec<Fr> = Vec::with_capacity(2 + l);
+        bases_affine.push(generators.g1_affine);
+        scalars.push(Scalar::ONE.0);
+        bases_affine.push(generators.h_affine[0]);
+        scalars.push(sig.s.0);
         for i in 0..l {
-            bases.push(generators.h[i + 1]);
+            bases_affine.push(generators.h_affine[i + 1]);
             scalars.push(messages[i].0);
         }
-        let msg_part = msm_projective(&bases, &scalars);
+        let msg_part = G1Projective::msm(&bases_affine, &scalars)
+            .expect("msg_part MSM length mismatch");
 
         // A_bar = A'^{-e} * M^{r1}
         let a_bar = a_prime * (-sig.e.0) + msg_part * r1.0;
@@ -133,14 +142,17 @@ impl BbsProof {
         let rho_m_tilde: Vec<Scalar> = (0..l).map(|_| Scalar::rand(rng)).collect();
 
         // T_BBS = A'^{-ρ_e} * g1^{ρ_r1} * h0^{ρ_s_tilde} * ∏_{i=1..L} h_i^{ρ_m_tilde[i]}
-        let mut t_bases = vec![a_prime.into_affine()];
-        let mut t_scalars = vec![-rho_e.0];
-        t_bases.push(generators.g1.into_affine());
+        // Use pre-cached affine generators for static bases; only a_prime needs affine conversion.
+        let mut t_bases: Vec<ark_bls12_381::G1Affine> = Vec::with_capacity(3 + l);
+        let mut t_scalars: Vec<Fr> = Vec::with_capacity(3 + l);
+        t_bases.push(a_prime.into_affine());
+        t_scalars.push(-rho_e.0);
+        t_bases.push(generators.g1_affine);
         t_scalars.push(rho_r1.0);
-        t_bases.push(generators.h[0].into_affine());
+        t_bases.push(generators.h_affine[0]);
         t_scalars.push(rho_s_tilde.0);
         for i in 0..l {
-            t_bases.push(generators.h[i + 1].into_affine());
+            t_bases.push(generators.h_affine[i + 1]);
             t_scalars.push(rho_m_tilde[i].0);
         }
         let t_bbs = G1Projective::msm(&t_bases, &t_scalars)
@@ -252,9 +264,14 @@ impl BbsProof {
         );
 
         // ---------- Pairing check: e(A', pk) == e(A_bar, g2) ----------
-        let pairing_left = ark_bls12_381::Bls12_381::pairing(self.a_prime, *pk);
-        let pairing_right = ark_bls12_381::Bls12_381::pairing(self.a_bar, generators.g2);
-        if pairing_left.0 != pairing_right.0 {
+        // Rewritten as a single multi-pairing: e(A', pk) * e(-A_bar, g2) == 1.
+        // One shared Miller loop + one final exponentiation instead of two
+        // separate pairings, cutting pairing cost roughly in half.
+        let pairing_check = ark_bls12_381::Bls12_381::multi_pairing(
+            [self.a_prime.into_affine(), (-self.a_bar).into_affine()],
+            [(*pk).into_affine(), generators.g2.into_affine()],
+        );
+        if pairing_check.0 != Fq12::ONE {
             return Err(ActError::VerificationFailed(
                 "Pairing check failed".into(),
             ));
@@ -262,14 +279,17 @@ impl BbsProof {
 
         // ---------- Schnorr MSM check ----------
         // LHS = A'^{-z_e} * g1^{z_r1} * h0^{z_s_tilde} * ∏_{i=1..L} h_i^{z_m_tilde[i]}
-        let mut lhs_bases = vec![self.a_prime.into_affine()];
-        let mut lhs_scalars = vec![-self.z_e.0];
-        lhs_bases.push(generators.g1.into_affine());
+        // Use cached affine generators for static bases.
+        let mut lhs_bases: Vec<ark_bls12_381::G1Affine> = Vec::with_capacity(3 + l);
+        let mut lhs_scalars: Vec<Fr> = Vec::with_capacity(3 + l);
+        lhs_bases.push(self.a_prime.into_affine());
+        lhs_scalars.push(-self.z_e.0);
+        lhs_bases.push(generators.g1_affine);
         lhs_scalars.push(self.z_r1.0);
-        lhs_bases.push(generators.h[0].into_affine());
+        lhs_bases.push(generators.h_affine[0]);
         lhs_scalars.push(self.z_s_tilde.0);
         for i in 0..l {
-            lhs_bases.push(generators.h[i + 1].into_affine());
+            lhs_bases.push(generators.h_affine[i + 1]);
             lhs_scalars.push(self.z_m_tilde[i].0);
         }
         let lhs = G1Projective::msm(&lhs_bases, &lhs_scalars)
@@ -298,33 +318,21 @@ impl BbsProof {
         disclosed: &[bool],
         aux: &[u8],
     ) -> Scalar {
-        let mut preimage = Vec::new();
-
-        // H_ctx (32 bytes)
-        preimage.extend_from_slice(&h_ctx.to_bytes());
-
-        // Public key (compressed)
-        pk.serialize_compressed(&mut preimage).unwrap();
-
-        // Proof elements (compressed)
-        a_prime.serialize_compressed(&mut preimage).unwrap();
-        a_bar.serialize_compressed(&mut preimage).unwrap();
-        t_bbs.serialize_compressed(&mut preimage).unwrap();
-
-        // Disclosed messages (only those marked true)
+        let mut hasher = sha2::Sha256::new();
+        let mut w = HasherWriter(&mut hasher);
+        w.write_all(&h_ctx.to_bytes()).unwrap();
+        pk.serialize_compressed(&mut w).unwrap();
+        a_prime.serialize_compressed(&mut w).unwrap();
+        a_bar.serialize_compressed(&mut w).unwrap();
+        t_bbs.serialize_compressed(&mut w).unwrap();
         for (i, &disc) in disclosed.iter().enumerate() {
             if disc {
-                messages[i].0.serialize_compressed(&mut preimage).unwrap();
+                messages[i].0.serialize_compressed(&mut w).unwrap();
             }
         }
-
-        // Auxiliary data (e.g., epoch, commitments, nonce)
-        preimage.extend_from_slice(aux);
-
-        // Domain separation string (optional, but already included via H_ctx)
-        // We follow the spec: challenge includes H_ctx and "Refresh"/"Spend" is in aux.
-
-        hash_to_scalar(&preimage)
+        w.write_all(aux).unwrap();
+        drop(w);
+        hash_to_scalar_from_hasher(hasher)
     }
 }
 

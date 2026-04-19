@@ -7,26 +7,19 @@
 //! `c_max` and `e_max` (both 32‑bit unsigned integers).
 
 extern crate alloc;
-use alloc::vec::Vec;
-use ark_std::vec;
-use ark_bls12_381::G1Projective;
+use ark_bls12_381::{Fr, G1Projective};
+use ark_ec::{CurveGroup, VariableBaseMSM};
 use ark_ff::Field;
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::RngCore;
-use ark_std::Zero;
+use sha2::Digest as _;
+use ark_std::io::Write as _;
 use crate::bbs_proof::BbsSignature;
 use crate::commitments::commit;
 use crate::error::{ActError, Result};
-use crate::hash::hash_to_scalar;
+use crate::hash::{hash_to_scalar_from_hasher, HasherWriter};
 use crate::setup::{Generators, ServerKeys};
 use crate::types::Scalar;
-
-fn msm_projective(bases: &[G1Projective], scalars: &[ark_bls12_381::Fr]) -> G1Projective {
-    bases
-        .iter()
-        .zip(scalars.iter())
-        .fold(G1Projective::zero(), |acc, (b, s)| acc + (*b * *s))
-}
 
 // ============================================================================
 // Client
@@ -77,16 +70,24 @@ impl ProofOfKnowledge {
         let alpha = Scalar::rand(rng);
         let beta = Scalar::rand(rng);
 
-        // T = alpha * h1 + beta * h0
-        let t = generators.h[1] * alpha.0 + generators.h[0] * beta.0;
+        // T = alpha * h1 + beta * h0 (2-base MSM with cached affines)
+        let t = {
+            let bases = [generators.h_affine[1], generators.h_affine[0]];
+            let scalars = [alpha.0, beta.0];
+            G1Projective::msm(&bases, &scalars).expect("T MSM length mismatch")
+        };
 
         // Compute challenge c = H(H_ctx || K_sub || T || "PoK:MasterSecret")
-        let mut preimage = Vec::new();
-        preimage.extend_from_slice(&h_ctx.to_bytes());
-        k_sub_commit.serialize_compressed(&mut preimage).unwrap();
-        t.serialize_compressed(&mut preimage).unwrap();
-        preimage.extend_from_slice(b"PoK:MasterSecret");
-        let c = hash_to_scalar(&preimage);
+        let c = {
+            let mut hasher = sha2::Sha256::new();
+            let mut w = HasherWriter(&mut hasher);
+            w.write_all(&h_ctx.to_bytes()).unwrap();
+            k_sub_commit.serialize_compressed(&mut w).unwrap();
+            t.serialize_compressed(&mut w).unwrap();
+            w.write_all(b"PoK:MasterSecret").unwrap();
+            drop(w);
+            hash_to_scalar_from_hasher(hasher)
+        };
 
         // Responses
         let s_k = alpha + c * k_sub;
@@ -108,15 +109,24 @@ impl ProofOfKnowledge {
         h_ctx: Scalar,
     ) -> Result<()> {
         // Recompute challenge
-        let mut preimage = Vec::new();
-        preimage.extend_from_slice(&h_ctx.to_bytes());
-        k_sub_commit.serialize_compressed(&mut preimage).unwrap();
-        self.t.serialize_compressed(&mut preimage).unwrap();
-        preimage.extend_from_slice(b"PoK:MasterSecret");
-        let c = hash_to_scalar(&preimage);
+        let c = {
+            let mut hasher = sha2::Sha256::new();
+            let mut w = HasherWriter(&mut hasher);
+            w.write_all(&h_ctx.to_bytes()).unwrap();
+            k_sub_commit.serialize_compressed(&mut w).unwrap();
+            self.t.serialize_compressed(&mut w).unwrap();
+            w.write_all(b"PoK:MasterSecret").unwrap();
+            drop(w);
+            hash_to_scalar_from_hasher(hasher)
+        };
 
         // Check: s_k * h1 + s_r * h0 == T + c * K_sub
-        let lhs = generators.h[1] * self.s_k.0 + generators.h[0] * self.s_r.0;
+        // Use cached affine generators.
+        let lhs = {
+            let bases = [generators.h_affine[1], generators.h_affine[0]];
+            let scalars = [self.s_k.0, self.s_r.0];
+            G1Projective::msm(&bases, &scalars).expect("verify MSM length mismatch")
+        };
         let rhs = self.t + k_sub_commit * c.0;
 
         if lhs != rhs {
@@ -242,22 +252,23 @@ impl MasterMintServer {
 
         // 4. Compute A_sub = (g1 * K_sub * h0^{s'} * h2^{c_max} * h3^{e_max})^{1/(e + sk_master)}
         //    Note: the message vector is (k_sub, c_max, e_max) on (h1, h2, h3).
-        let mut bases = vec![
-            generators.g1,
-            request.k_sub_commit,
-            generators.h[0],
-            generators.h[2],
-            generators.h[3],
+        //    Use cached affine generators for static bases; only K_sub (dynamic) needs affine conversion.
+        let k_sub_commit_affine = request.k_sub_commit.into_affine();
+        let bases = [
+            generators.g1_affine,
+            k_sub_commit_affine,
+            generators.h_affine[0],
+            generators.h_affine[2],
+            generators.h_affine[3],
         ];
-        let mut scalars = vec![
-            Scalar::ONE.0,
-            Scalar::ONE.0,
+        let scalars = [
+            Fr::from(1u64),
+            Fr::from(1u64),
             s_prime_sub.0,
             Scalar::from(c_max).0,
             Scalar::from(e_max).0,
         ];
-
-        let msg_part = msm_projective(&bases, &scalars);
+        let msg_part = G1Projective::msm(&bases, &scalars).expect("issue MSM length mismatch");
 
         let denom = e_sub + keys.sk_master;
         let denom_inv = denom

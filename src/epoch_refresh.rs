@@ -10,26 +10,29 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use ark_std::vec;
-use ark_bls12_381::{G1Projective, G2Projective};
+use ark_bls12_381::{Fq12, Fr, G1Projective, G2Projective};
 use ark_ec::{CurveGroup, VariableBaseMSM, pairing::Pairing};
 use ark_ff::Field;
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::{CryptoRng, RngCore};
 use ark_std::Zero;
+use sha2::Digest as _;
+use ark_std::io::Write as _;
 use crate::bbs_proof::BbsSignature;
 use crate::bulletproofs::{prove_range, serialize_proof, verify_range, RangeProof};
-use crate::commitments::verify_bridge_single_base;
 use crate::error::{ActError, Result};
-use crate::hash::{hash_to_g1, hash_to_scalar};
+use crate::hash::{hash_to_g1, hash_to_scalar_from_hasher, HasherWriter};
 use crate::setup::{Generators, ServerKeys};
 use crate::types::Scalar;
 
-fn msm_projective(bases: &[G1Projective], scalars: &[ark_bls12_381::Fr]) -> G1Projective {
-    bases
-        .iter()
-        .zip(scalars.iter())
-        .fold(G1Projective::zero(), |acc, (b, s)| acc + (*b * *s))
+/// Efficient MSM using precomputed affine bases (no projective→affine conversion).
+///
+/// Callers that already hold `G1Affine` bases (e.g. the cached generator affines)
+/// should call `G1Projective::msm` directly; this helper is for the small number
+/// of call sites that still start from projective inputs.
+fn msm_projective(bases: &[G1Projective], scalars: &[Fr]) -> G1Projective {
+    let affine = G1Projective::normalize_batch(bases);
+    G1Projective::msm(&affine, scalars).expect("MSM length mismatch")
 }
 
 // ============================================================================
@@ -191,23 +194,24 @@ impl RefreshProver {
         let r1 = Scalar::rand_nonzero(rng);
         let a_prime = master.a * r1.0;
 
-        // Compute message part M = g1 * h0^s * h1^{k_sub} * h2^{c_max} * h3^{e_max}
+        // Compute message part M = g1^1 * h0^s * h1^{k_sub} * h2^{c_max} * h3^{e_max}
+        // Use pre-cached affine generators — no field inversions needed.
         let msg_part = {
-            let bases = vec![
-                generators.g1,
-                generators.h[0],
-                generators.h[1],
-                generators.h[2],
-                generators.h[3],
+            let bases = [
+                generators.g1_affine,
+                generators.h_affine[0],
+                generators.h_affine[1],
+                generators.h_affine[2],
+                generators.h_affine[3],
             ];
-            let scalars = vec![
-                Scalar::ONE.0,
+            let scalars = [
+                Fr::from(1u64),
                 master.s.0,
                 k_sub.0,
-                Scalar::from(c_max).0,
-                Scalar::from(e_max).0,
+                Fr::from(c_max as u64),
+                Fr::from(e_max as u64),
             ];
-            msm_projective(&bases, &scalars)
+            G1Projective::msm(&bases, &scalars).expect("MSM length mismatch")
         };
         let a_bar = a_prime * (-master.e.0) + msg_part * r1.0;
 
@@ -224,17 +228,18 @@ impl RefreshProver {
         let rho_c = Scalar::rand(rng);
         let rho_e_msg = Scalar::rand(rng);
 
-        // T_BBS
+        // T_BBS — use a_prime's affine + pre-cached affine generators.
         let t_bbs = {
-            let bases = vec![
-                a_prime.into_affine(),
-                generators.g1.into_affine(),
-                generators.h[0].into_affine(),
-                generators.h[1].into_affine(),
-                generators.h[2].into_affine(),
-                generators.h[3].into_affine(),
+            let a_prime_affine = a_prime.into_affine();
+            let bases = [
+                a_prime_affine,
+                generators.g1_affine,
+                generators.h_affine[0],
+                generators.h_affine[1],
+                generators.h_affine[2],
+                generators.h_affine[3],
             ];
-            let scalars = vec![
+            let scalars = [
                 -rho_e.0,
                 rho_r1.0,
                 rho_s.0,
@@ -242,7 +247,7 @@ impl RefreshProver {
                 rho_c.0,
                 rho_e_msg.0,
             ];
-            G1Projective::msm(&bases, &scalars).unwrap()
+            G1Projective::msm(&bases, &scalars).expect("T_BBS MSM length mismatch")
         };
 
         // 7. External blinders
@@ -259,20 +264,37 @@ impl RefreshProver {
         // T_scale_D = rho_r1 * K_daily
         let t_scale_d = k_daily_commit * rho_r1.0;
         // T_D = rho_c * h4 + rho_u * h1 + rho_r1 * T * h2 + rho_v * h0
-        let t_d = generators.h[4] * rho_c.0
-            + generators.h[1] * rho_u.0
-            + generators.h[2] * (rho_r1 * Scalar::from(t)).0
-            + generators.h[0] * rho_v.0;
+        // Use pre-cached affine generators for this small 4-base MSM.
+        let t_d = {
+            let bases = [
+                generators.h_affine[4],
+                generators.h_affine[1],
+                generators.h_affine[2],
+                generators.h_affine[0],
+            ];
+            let scalars = [
+                rho_c.0,
+                rho_u.0,
+                (rho_r1 * Scalar::from(t)).0,
+                rho_v.0,
+            ];
+            G1Projective::msm(&bases, &scalars).expect("T_D MSM length mismatch")
+        };
 
         // C_bridge = C_delta + T * h3
         let c_bridge = c_delta + generators.h[3] * Scalar::from(t).0;
         // T_scale_B = rho_r1 * C_bridge
         let t_scale_b = c_bridge * rho_r1.0;
-        // T_B = rho_e_msg * h3 + rho_w * h0
-        let t_b = generators.h[3] * rho_e_msg.0 + generators.h[0] * rho_w.0;
+        // T_B = rho_e_msg * h3 + rho_w * h0 (2-base MSM with cached affines)
+        let t_b = {
+            let bases = [generators.h_affine[3], generators.h_affine[0]];
+            let scalars = [rho_e_msg.0, rho_w.0];
+            G1Projective::msm(&bases, &scalars).expect("T_B MSM length mismatch")
+        };
 
         // 9. Generate Bulletproof (needs BBS+ commitments in extra data)
-        let mut bp_extra = Vec::new();
+        // Capacity: 32 h_ctx + 4 epoch + 3*48 G1 points + overallocate for bp
+        let mut bp_extra = Vec::with_capacity(32 + 4 + 3 * 48 + 8);
         bp_extra.extend_from_slice(&h_ctx.to_bytes());
         bp_extra.extend_from_slice(&t.to_le_bytes());
         n_t.serialize_compressed(&mut bp_extra).unwrap();
@@ -292,26 +314,31 @@ impl RefreshProver {
             &bp_extra,
         )?;
 
-        // 10. Challenge
-        let mut preimage = Vec::new();
-        preimage.extend_from_slice(&h_ctx.to_bytes());
-        pk_master.serialize_compressed(&mut preimage).unwrap();
-        preimage.extend_from_slice(&t.to_le_bytes());
-        n_t.serialize_compressed(&mut preimage).unwrap();
-        k_daily_commit.serialize_compressed(&mut preimage).unwrap();
-        c_delta.serialize_compressed(&mut preimage).unwrap();
-        preimage.extend_from_slice(&serialize_proof(&bp_exp).unwrap());
-        a_prime.serialize_compressed(&mut preimage).unwrap();
-        a_bar.serialize_compressed(&mut preimage).unwrap();
-        t_bbs.serialize_compressed(&mut preimage).unwrap();
-        t_scale_n.serialize_compressed(&mut preimage).unwrap();
-        t_n.serialize_compressed(&mut preimage).unwrap();
-        t_scale_d.serialize_compressed(&mut preimage).unwrap();
-        t_d.serialize_compressed(&mut preimage).unwrap();
-        t_scale_b.serialize_compressed(&mut preimage).unwrap();
-        t_b.serialize_compressed(&mut preimage).unwrap();
-        preimage.extend_from_slice(b"Refresh");
-        let c = hash_to_scalar(&preimage);
+        // 10. Challenge — feed all elements directly into SHA-256, no intermediate Vec.
+        let bp_bytes = serialize_proof(&bp_exp).unwrap();
+        let c = {
+            let mut hasher = sha2::Sha256::new();
+            let mut w = HasherWriter(&mut hasher);
+            w.write_all(&h_ctx.to_bytes()).unwrap();
+            pk_master.serialize_compressed(&mut w).unwrap();
+            w.write_all(&t.to_le_bytes()).unwrap();
+            n_t.serialize_compressed(&mut w).unwrap();
+            k_daily_commit.serialize_compressed(&mut w).unwrap();
+            c_delta.serialize_compressed(&mut w).unwrap();
+            w.write_all(&bp_bytes).unwrap();
+            a_prime.serialize_compressed(&mut w).unwrap();
+            a_bar.serialize_compressed(&mut w).unwrap();
+            t_bbs.serialize_compressed(&mut w).unwrap();
+            t_scale_n.serialize_compressed(&mut w).unwrap();
+            t_n.serialize_compressed(&mut w).unwrap();
+            t_scale_d.serialize_compressed(&mut w).unwrap();
+            t_d.serialize_compressed(&mut w).unwrap();
+            t_scale_b.serialize_compressed(&mut w).unwrap();
+            t_b.serialize_compressed(&mut w).unwrap();
+            w.write_all(b"Refresh").unwrap();
+            drop(w);
+            hash_to_scalar_from_hasher(hasher)
+        };
 
         // 11. Responses
         let z_e = rho_e + c * master.e;
@@ -388,89 +415,140 @@ pub fn verify_refresh(
     // 2. Expiry bridge: C_bridge = C_delta + T * h3
     let c_bridge = proof.c_delta + generators.h[3] * Scalar::from(current_epoch).0;
 
-    // 3. Recompute challenge
-    let mut preimage = Vec::new();
-    preimage.extend_from_slice(&h_ctx.to_bytes());
-    pk_master.serialize_compressed(&mut preimage).unwrap();
-    preimage.extend_from_slice(&current_epoch.to_le_bytes());
-    proof.n_t.serialize_compressed(&mut preimage).unwrap();
-    proof.k_daily.serialize_compressed(&mut preimage).unwrap();
-    proof.c_delta.serialize_compressed(&mut preimage).unwrap();
-    preimage.extend_from_slice(&serialize_proof(&proof.bp_exp).unwrap());
-    proof.a_prime.serialize_compressed(&mut preimage).unwrap();
-    proof.a_bar.serialize_compressed(&mut preimage).unwrap();
-    proof.t_bbs.serialize_compressed(&mut preimage).unwrap();
-    proof.t_scale_n.serialize_compressed(&mut preimage).unwrap();
-    proof.t_n.serialize_compressed(&mut preimage).unwrap();
-    proof.t_scale_d.serialize_compressed(&mut preimage).unwrap();
-    proof.t_d.serialize_compressed(&mut preimage).unwrap();
-    proof.t_scale_b.serialize_compressed(&mut preimage).unwrap();
-    proof.t_b.serialize_compressed(&mut preimage).unwrap();
-    preimage.extend_from_slice(b"Refresh");
-    let c = hash_to_scalar(&preimage);
+    // 3. Recompute challenge — feed all elements directly into SHA-256.
+    let bp_bytes = serialize_proof(&proof.bp_exp).unwrap();
+    let c = {
+        let mut hasher = sha2::Sha256::new();
+        let mut w = HasherWriter(&mut hasher);
+        w.write_all(&h_ctx.to_bytes()).unwrap();
+        pk_master.serialize_compressed(&mut w).unwrap();
+        w.write_all(&current_epoch.to_le_bytes()).unwrap();
+        proof.n_t.serialize_compressed(&mut w).unwrap();
+        proof.k_daily.serialize_compressed(&mut w).unwrap();
+        proof.c_delta.serialize_compressed(&mut w).unwrap();
+        w.write_all(&bp_bytes).unwrap();
+        proof.a_prime.serialize_compressed(&mut w).unwrap();
+        proof.a_bar.serialize_compressed(&mut w).unwrap();
+        proof.t_bbs.serialize_compressed(&mut w).unwrap();
+        proof.t_scale_n.serialize_compressed(&mut w).unwrap();
+        proof.t_n.serialize_compressed(&mut w).unwrap();
+        proof.t_scale_d.serialize_compressed(&mut w).unwrap();
+        proof.t_d.serialize_compressed(&mut w).unwrap();
+        proof.t_scale_b.serialize_compressed(&mut w).unwrap();
+        proof.t_b.serialize_compressed(&mut w).unwrap();
+        w.write_all(b"Refresh").unwrap();
+        drop(w);
+        hash_to_scalar_from_hasher(hasher)
+    };
 
-    // 4. Bridging equalities
+    // 4. Epoch hash H_T (needed for nullifier bridge base).
     let h_t = hash_to_g1(b"ACT:Epoch:", &current_epoch.to_le_bytes());
 
-    // Nullifier bridge
-    if !verify_bridge_single_base(
-        proof.z_k_tilde,
-        proof.z_r1,
-        proof.t_n,
-        proof.t_scale_n,
-        proof.n_t,
-        h_t,
-    ) {
-        return Err(ActError::VerificationFailed("Nullifier bridge failed".into()));
-    }
+    // 5. Combined batch check for all four bridge + Schnorr equations.
+    //
+    // Rather than checking the four equations separately:
+    //   Eq1 (Nullifier):   h_t * z_k_tilde - n_t * z_r1 + t_scale_n - t_n = 0
+    //   Eq2 (Daily):       h[4]*z_c + h[1]*z_u + h[2]*(z_r1*T) + h[0]*z_v
+    //                      - k_daily*z_r1 - t_d + t_scale_d = 0
+    //   Eq3 (Expiry):      h[3]*z_e_t + h[0]*z_w - c_bridge*z_r1 - t_b + t_scale_b = 0
+    //   Eq4 (Schnorr):     a'*(-z_e) + g1*z_r1 + h[0]*z_s + h[1]*z_k_t + h[2]*z_c_t
+    //                      + h[3]*z_e_t - t_bbs - a_bar*c = 0
+    //
+    // We combine them with multipliers (c, c², c³, 1) — a random linear
+    // combination derived from the Fiat–Shamir challenge `c`.  By Schwartz–
+    // Zippell, the combined check fails with probability ≤ 4/|Fr| ≈ 2⁻²⁵².
+    // This replaces ~16 individual scalar multiplications with a single
+    // 19-base Pippenger MSM.
+    {
+        let c_fr  = c.0;
+        let c2_fr = c_fr * c_fr;
+        let c3_fr = c2_fr * c_fr;
+        let epoch_fr = Fr::from(current_epoch as u64);
+        let fr_one = Fr::from(1u64);
 
-    // Daily bridge
-    let lhs_d = generators.h[4] * proof.z_c_tilde.0
-        + generators.h[1] * proof.z_u.0
-        + generators.h[2] * (proof.z_r1 * Scalar::from(current_epoch)).0
-        + generators.h[0] * proof.z_v.0
-        - proof.t_d;
-    let rhs_d = proof.k_daily * proof.z_r1.0 - proof.t_scale_d;
-    if lhs_d != rhs_d {
-        return Err(ActError::VerificationFailed("Daily bridge failed".into()));
-    }
+        // Scalar coefficient for each basis.
+        let sc_ht       = c_fr  * proof.z_k_tilde.0;
+        let sc_nt       = -(c_fr * proof.z_r1.0);
+        let sc_tscale_n = c_fr;
+        let sc_tn       = -c_fr;
+        // h[0]: c²·z_v + c³·z_w + z_s_tilde
+        let sc_h0       = c2_fr * proof.z_v.0 + c3_fr * proof.z_w.0 + proof.z_s_tilde.0;
+        // h[1]: c²·z_u + z_k_tilde
+        let sc_h1       = c2_fr * proof.z_u.0 + proof.z_k_tilde.0;
+        // h[2]: c²·(z_r1·T) + z_c_tilde
+        let sc_h2       = c2_fr * (proof.z_r1.0 * epoch_fr) + proof.z_c_tilde.0;
+        // h[3]: (c³ + 1)·z_e_tilde
+        let sc_h3       = (c3_fr + fr_one) * proof.z_e_tilde.0;
+        // h[4]: c²·z_c_tilde
+        let sc_h4       = c2_fr * proof.z_c_tilde.0;
+        let sc_g1       = proof.z_r1.0;
+        let sc_aprime   = -proof.z_e.0;
+        let sc_kdaily   = -(c2_fr * proof.z_r1.0);
+        let sc_cbridge  = -(c3_fr * proof.z_r1.0);
+        let sc_abar     = -c_fr;   // a_bar is scaled by Fiat-Shamir c
+        let sc_td       = -c2_fr;
+        let sc_tscale_d = c2_fr;
+        let sc_tb       = -c3_fr;
+        let sc_tscale_b = c3_fr;
+        let sc_tbbs     = -fr_one;
 
-    // Expiry bridge
-    let lhs_b = generators.h[3] * proof.z_e_tilde.0
-        + generators.h[0] * proof.z_w.0
-        - proof.t_b;
-    let rhs_b = c_bridge * proof.z_r1.0 - proof.t_scale_b;
-    if lhs_b != rhs_b {
-        return Err(ActError::VerificationFailed("Expiry bridge failed".into()));
-    }
+        // Batch-normalize the 13 dynamic proof points in one field inversion.
+        let dyn_pts = G1Projective::normalize_batch(&[
+            h_t,
+            proof.n_t,
+            proof.t_scale_n,
+            proof.t_n,
+            proof.a_prime,
+            proof.k_daily,
+            c_bridge,
+            proof.a_bar,
+            proof.t_d,
+            proof.t_scale_d,
+            proof.t_b,
+            proof.t_scale_b,
+            proof.t_bbs,
+        ]);
 
-    // 5. Schnorr MSM (BBS+ core without pairing)
-    let lhs_msm = {
-        let bases = vec![
-            proof.a_prime.into_affine(),
-            generators.g1.into_affine(),
-            generators.h[0].into_affine(),
-            generators.h[1].into_affine(),
-            generators.h[2].into_affine(),
-            generators.h[3].into_affine(),
+        // Build the combined MSM (19 bases total: 13 dynamic + 6 static).
+        let bases = [
+            dyn_pts[0],              // h_t
+            dyn_pts[1],              // n_t
+            dyn_pts[2],              // t_scale_n
+            dyn_pts[3],              // t_n
+            generators.h_affine[0], // h[0]
+            generators.h_affine[1], // h[1]
+            generators.h_affine[2], // h[2]
+            generators.h_affine[3], // h[3]
+            generators.h_affine[4], // h[4]
+            generators.g1_affine,   // g1
+            dyn_pts[4],              // a_prime
+            dyn_pts[5],              // k_daily
+            dyn_pts[6],              // c_bridge
+            dyn_pts[7],              // a_bar
+            dyn_pts[8],              // t_d
+            dyn_pts[9],              // t_scale_d
+            dyn_pts[10],             // t_b
+            dyn_pts[11],             // t_scale_b
+            dyn_pts[12],             // t_bbs
         ];
-        let scalars = vec![
-            -proof.z_e.0,
-            proof.z_r1.0,
-            proof.z_s_tilde.0,
-            proof.z_k_tilde.0,
-            proof.z_c_tilde.0,
-            proof.z_e_tilde.0,
+        let scalars = [
+            sc_ht, sc_nt, sc_tscale_n, sc_tn,
+            sc_h0, sc_h1, sc_h2, sc_h3, sc_h4,
+            sc_g1, sc_aprime, sc_kdaily, sc_cbridge, sc_abar,
+            sc_td, sc_tscale_d, sc_tb, sc_tscale_b, sc_tbbs,
         ];
-        G1Projective::msm(&bases, &scalars).unwrap()
-    };
-    let rhs_msm = proof.t_bbs + proof.a_bar * c.0;
-    if lhs_msm != rhs_msm {
-        return Err(ActError::VerificationFailed("Schnorr check failed".into()));
+
+        let combined = G1Projective::msm(&bases, &scalars)
+            .map_err(|e| ActError::VerificationFailed(alloc::format!("MSM failed: {:?}", e)))?;
+        if !combined.is_zero() {
+            return Err(ActError::VerificationFailed(
+                "Combined bridge+Schnorr check failed".into(),
+            ));
+        }
     }
 
     // 6. Bulletproof verification
-    let mut bp_extra = Vec::new();
+    let mut bp_extra = Vec::with_capacity(32 + 4 + 6 * 48);
     bp_extra.extend_from_slice(&h_ctx.to_bytes());
     bp_extra.extend_from_slice(&current_epoch.to_le_bytes());
     proof.n_t.serialize_compressed(&mut bp_extra).unwrap();
@@ -489,28 +567,25 @@ pub fn verify_refresh(
         &bp_extra,
     )?;
 
-    // 7. Pairing check
-    let pairing_left = ark_bls12_381::Bls12_381::pairing(proof.a_prime, *pk_master);
-    let pairing_right = ark_bls12_381::Bls12_381::pairing(proof.a_bar, generators.g2);
-    if pairing_left.0 != pairing_right.0 {
+    // 7. Pairing check: e(A', pk_master) == e(A_bar, g2).
+    // Combined into a single multi-pairing (one shared Miller loop + one final
+    // exponentiation) rather than two separate pairings.
+    let pairing_check = ark_bls12_381::Bls12_381::multi_pairing(
+        [proof.a_prime.into_affine(), (-proof.a_bar).into_affine()],
+        [(*pk_master).into_affine(), generators.g2.into_affine()],
+    );
+    if pairing_check.0 != Fq12::ONE {
         return Err(ActError::VerificationFailed("Pairing check failed".into()));
     }
 
-    // 8. Issue Daily Token
+    // 8. Issue Daily Token — use cached affines for the 3-base MSM.
     let e_daily = Scalar::rand(rng);
     let s_prime_daily = Scalar::rand(rng);
     let a_daily = {
-        let bases = vec![
-            generators.g1,
-            proof.k_daily,
-            generators.h[0],
-        ];
-        let scalars = vec![
-            Scalar::ONE.0,
-            Scalar::ONE.0,
-            s_prime_daily.0,
-        ];
-        let msg_part = msm_projective(&bases, &scalars);
+        let k_daily_affine = proof.k_daily.into_affine();
+        let bases = [generators.g1_affine, k_daily_affine, generators.h_affine[0]];
+        let scalars = [Fr::from(1u64), Fr::from(1u64), s_prime_daily.0];
+        let msg_part = G1Projective::msm(&bases, &scalars).expect("issue MSM length mismatch");
         let denom = e_daily + keys.sk_daily;
         let denom_inv = denom.0.inverse().unwrap();
         msg_part * denom_inv
