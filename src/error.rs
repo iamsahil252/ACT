@@ -47,4 +47,3 @@ impl From<redis::RedisError> for ActError {
         Self::DatabaseError(value.to_string())
     }
 }
-

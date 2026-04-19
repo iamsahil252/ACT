@@ -91,7 +91,7 @@ impl NullifierManager {
         let key = format!("act:epoch:{}:nullifiers", self.config.current_epoch);
         let added: u64 = conn.sadd(&key, n_t.0.as_slice()).await?;
         let ttl = self.config.epoch_grace_period_secs + 86400;
-        let _: () = conn.expire(&key, ttl as i64).await?;
+        let _: () = conn.expire(&key, ttl.try_into().map_err(|_| ActError::ProtocolError("TTL overflow".into()))?).await?;
         Ok(added == 1)
     }
 
@@ -107,7 +107,7 @@ impl NullifierManager {
         let key = format!("act:spend:{}:nullifiers", epoch_key);
         let added: u64 = conn.sadd(&key, k_cur.to_bytes().as_slice()).await?;
         let ttl = self.config.epoch_grace_period_secs + 86400;
-        let _: () = conn.expire(&key, ttl as i64).await?;
+        let _: () = conn.expire(&key, ttl.try_into().map_err(|_| ActError::ProtocolError("TTL overflow".into()))?).await?;
         Ok(added == 1)
     }
 }
@@ -144,7 +144,8 @@ impl IdempotencyCache {
 
     pub async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
         let mut conn = self.client.get_async_connection().await?;
-        let _: () = conn.set_ex(key, value, self.ttl_secs as usize).await?;
+        let ttl: usize = self.ttl_secs.try_into().map_err(|_| ActError::ProtocolError("TTL overflow".into()))?;
+        let _: () = conn.set_ex(key, value, ttl).await?;
         Ok(())
     }
 
@@ -372,7 +373,8 @@ impl NonceManager {
         rng.fill_bytes(&mut nonce);
         let mut conn = self.client.get_async_connection().await?;
         let key = format!("act:nonce:{}", hex::encode(nonce));
-        let _: () = conn.set_ex(&key, b"1", self.ttl_secs as usize).await?;
+        let ttl: usize = self.ttl_secs.try_into().map_err(|_| ActError::ProtocolError("TTL overflow".into()))?;
+        let _: () = conn.set_ex(&key, b"1", ttl).await?;
         Ok(nonce)
     }
 
