@@ -238,9 +238,11 @@ impl MerkleTree {
             return None;
         }
         let padded_len = self.leaves.len().next_power_of_two();
-        let mut hashes: Vec<[u8; 32]> = ark_std::iter::repeat([0u8; 16])
-            .take(padded_len - self.leaves.len())
-            .chain(self.leaves.iter().copied())
+        let mut level: Vec<[u8; 32]> = self
+            .leaves
+            .iter()
+            .copied()
+            .chain(ark_std::iter::repeat([0u8; 16]).take(padded_len - self.leaves.len()))
             .map(|leaf| {
                 let mut h = [0u8; 32];
                 h.copy_from_slice(Sha256::digest(&leaf).as_slice());
@@ -250,22 +252,22 @@ impl MerkleTree {
 
         let mut siblings = Vec::new();
         let mut idx = index;
-        let mut level_size = padded_len;
-        while level_size > 1 {
+        while level.len() > 1 {
             let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
-            siblings.push(hashes[sibling_idx]);
-            let parent_idx = idx / 2;
-            let mut hasher = Sha256::new();
-            if idx % 2 == 0 {
-                hasher.update(hashes[idx]);
-                hasher.update(hashes[sibling_idx]);
-            } else {
-                hasher.update(hashes[sibling_idx]);
-                hasher.update(hashes[idx]);
+            siblings.push(level[sibling_idx]);
+
+            let mut next_level = Vec::with_capacity(level.len() / 2);
+            for pair in level.chunks_exact(2) {
+                let mut hasher = Sha256::new();
+                hasher.update(pair[0]);
+                hasher.update(pair[1]);
+                let digest = hasher.finalize();
+                let mut parent = [0u8; 32];
+                parent.copy_from_slice(digest.as_slice());
+                next_level.push(parent);
             }
-            hashes[parent_idx].copy_from_slice(hasher.finalize().as_slice());
-            idx = parent_idx;
-            level_size /= 2;
+            idx /= 2;
+            level = next_level;
         }
 
         Some(MerkleProof {
@@ -298,7 +300,7 @@ impl BloomFilter {
     }
 
     fn hash(&self, data: &[u8], seed: u64) -> usize {
-        use ark_std::collections::hash_map::DefaultHasher;
+        use std::collections::hash_map::DefaultHasher;
         use ark_std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
         data.hash(&mut hasher);
