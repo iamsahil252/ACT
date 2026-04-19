@@ -14,6 +14,7 @@
 //! - All challenges are bound to the application context hash `H_ctx` and
 //!   include all public parameters to prevent cross‑deployment replay.
 extern crate alloc;
+use alloc::format;
 use alloc::vec::Vec;
 use ark_std::vec;
 use ark_bls12_381::{Fr, G1Projective, G2Projective};

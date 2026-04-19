@@ -9,23 +9,20 @@
 //!
 //! Subgroup validation is enforced on all deserialized group elements.
 
-extern crate alloc;
-use alloc::string::String;
-use alloc::vec::Vec;
 use ark_std::io::{Read, Write};
-use ark_std::format;
 
 use ark_bls12_381::{Fr, G1Affine, G2Affine, G1Projective, G2Projective};
-use ark_ec::{AffineRepr, CurveGroup};
-use ark_ff::{BigInteger, BigInteger256, PrimeField};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
+use ark_ec::{AffineRepr, CurveGroup, Group};
+use ark_ff::{Field, PrimeField};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, SerializationError, Validate, Valid};
 use ark_std::rand::{
     distributions::{Distribution, Standard},
     Rng, RngCore,
 };
+use ark_std::{UniformRand, Zero};
 use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
+use core::fmt;
+use core::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
 
 use crate::error::{ActError, Result};
 
@@ -72,8 +69,7 @@ impl Scalar {
     pub fn to_bytes(&self) -> [u8; 32] {
         let mut bytes = [0u8; 32];
         self.0
-            .into_bigint()
-            .write_le(&mut bytes[..])
+            .serialize_compressed(&mut bytes[..])
             .expect("32 bytes sufficient");
         bytes
     }
@@ -84,12 +80,9 @@ impl Scalar {
     /// Returns `ActError::InvalidScalar` if the bytes represent a value ≥ the
     /// group order.
     pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self> {
-        let bigint = BigInteger256::read_le(&bytes[..])?;
-        if bigint >= Fr::MODULUS {
-            return Err(ActError::InvalidScalar);
-        }
-        let fr = Fr::from_bigint(bigint).ok_or(ActError::InvalidScalar)?;
-        Ok(Scalar(fr))
+        Fr::deserialize_compressed(&bytes[..])
+            .map(Scalar)
+            .map_err(|_| ActError::InvalidScalar)
     }
 
     /// Create from a 32‑byte array without canonical check (for trusted inputs).
@@ -97,9 +90,9 @@ impl Scalar {
     /// # Safety
     /// Only use when the bytes are known to represent a valid field element.
     pub(crate) fn from_bytes_unchecked(bytes: &[u8; 32]) -> Self {
-        let bigint = BigInteger256::read_le(&bytes[..]).unwrap();
-        let fr = Fr::from_bigint(bigint).unwrap();
-        Scalar(fr)
+        Fr::deserialize_uncompressed_unchecked(&bytes[..])
+            .map(Scalar)
+            .unwrap_or_else(|_| Scalar(Fr::from_le_bytes_mod_order(bytes)))
     }
 
     /// Compute the multiplicative inverse.
@@ -220,10 +213,16 @@ impl CanonicalSerialize for Scalar {
         &self,
         mut writer: W,
         _compress: Compress,
-    ) -> ark_std::io::Result<()> {
+    ) -> core::result::Result<(), SerializationError> {
         self.0.serialize_with_mode(&mut writer, Compress::Yes)
     }
     fn serialized_size(&self, _compress: Compress) -> usize { 32 }
+}
+
+impl Valid for Scalar {
+    fn check(&self) -> core::result::Result<(), SerializationError> {
+        Ok(())
+    }
 }
 
 impl CanonicalDeserialize for Scalar {
@@ -231,7 +230,7 @@ impl CanonicalDeserialize for Scalar {
         mut reader: R,
         compress: Compress,
         validate: Validate,
-    ) -> ark_std::io::Result<Self> {
+    ) -> core::result::Result<Self, SerializationError> {
         let fr = Fr::deserialize_with_mode(&mut reader, compress, validate)?;
         Ok(Scalar(fr))
     }
