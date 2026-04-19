@@ -5,10 +5,11 @@
 //! generated with distinct signing keys for Master and Daily tokens as required
 //! by the specification.
 
-use ark_bls12_381::{G1Projective, G2Projective};
-use ark_ec::Group;
+use ark_bls12_381::{G1Affine, G1Projective, G2Projective};
+use ark_ec::{CurveGroup, Group};
 use ark_std::rand::RngCore;
 use ark_std::Zero;
+use std::sync::OnceLock;
 use crate::hash::hash_to_g1;
 use crate::types::Scalar;
 
@@ -16,15 +17,46 @@ use crate::types::Scalar;
 ///
 /// The generators are created deterministically using the domain separation tag
 /// `"ACT:BBS:"` followed by the index.
+///
+/// **Performance:** affine forms (`g1_affine`, `h_affine`) are precomputed via
+/// a single batch field inversion at initialization and cached in the global
+/// singleton so that MSM callers never pay for projective→affine conversions.
 #[derive(Clone, Debug)]
 pub struct Generators {
     pub g1: G1Projective,
     pub g2: G2Projective,
     pub h: [G1Projective; 5],
+    /// Precomputed affine form of `g1` (z = 1 for the standard generator,
+    /// so this is trivially free).
+    pub g1_affine: G1Affine,
+    /// Precomputed affine forms of `h[0..5]`, computed via a single batch
+    /// field inversion at initialization time.
+    pub h_affine: [G1Affine; 5],
 }
 
+/// Process-wide singleton for the deterministic BBS+ generators.
+///
+/// The five `hash_to_g1` calls and the batch affine normalization happen
+/// exactly once per process; all subsequent `Generators::new()` calls return a
+/// cheap clone.
+static GENERATORS: OnceLock<Generators> = OnceLock::new();
+
 impl Generators {
+    /// Return the process-wide singleton generators (initialised on first call).
+    pub fn global() -> &'static Self {
+        GENERATORS.get_or_init(Self::compute)
+    }
+
+    /// Construct the generators.
+    ///
+    /// In practice this just clones the singleton so the expensive hash-to-curve
+    /// work is never repeated after the first call.
     pub fn new() -> Self {
+        Self::global().clone()
+    }
+
+    /// Perform the actual expensive initialisation (called at most once).
+    fn compute() -> Self {
         let g1 = G1Projective::generator();
         let g2 = G2Projective::generator();
         let dst = b"ACT:BBS:";
@@ -35,7 +67,17 @@ impl Generators {
             let msg = (i as u32).to_be_bytes();
             *elem = hash_to_g1(dst, &msg);
         }
-        Self { g1, g2, h }
+
+        // Single batch field inversion to convert all h[0..5] to affine form.
+        // This is the only batch inversion needed during the entire lifetime of
+        // the generators.
+        let h_batch = G1Projective::normalize_batch(&h);
+        let h_affine = [h_batch[0], h_batch[1], h_batch[2], h_batch[3], h_batch[4]];
+
+        // g1 is the standard generator (z-coordinate = 1), so into_affine is free.
+        let g1_affine = g1.into_affine();
+
+        Self { g1, g2, h, g1_affine, h_affine }
     }
 }
 
