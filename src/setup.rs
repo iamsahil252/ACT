@@ -9,8 +9,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 use ark_std::vec;
 use ark_bls12_381::{G1Projective, G2Projective};
-use ark_ec::CurveGroup;
+use ark_ec::Group;
 use ark_std::rand::RngCore;
+use ark_std::Zero;
 use crate::hash::hash_to_g1;
 use crate::types::Scalar;
 

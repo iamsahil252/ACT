@@ -14,17 +14,25 @@
 //! - All challenges are bound to the application context hash `H_ctx` and
 //!   include all public parameters to prevent cross‑deployment replay.
 extern crate alloc;
+use alloc::format;
 use alloc::vec::Vec;
 use ark_std::vec;
 use ark_bls12_381::{Fr, G1Projective, G2Projective};
 use ark_ec::{pairing::Pairing, CurveGroup, VariableBaseMSM};
-use ark_ff::{PrimeField, Zero};
+use ark_ff::{Field, PrimeField, Zero};
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::RngCore;
 use crate::error::{ActError, Result};
 use crate::hash::hash_to_scalar;
 use crate::setup::Generators;
 use crate::types::Scalar;
+
+fn msm_projective(bases: &[G1Projective], scalars: &[Fr]) -> G1Projective {
+    bases
+        .iter()
+        .zip(scalars.iter())
+        .fold(G1Projective::zero(), |acc, (b, s)| acc + (*b * *s))
+}
 
 /// A BBS+ signature.
 #[derive(Clone, Debug)]
@@ -104,16 +112,15 @@ impl BbsProof {
 
         // Compute the message part: M = g1 * h0^s * ∏_{i=1..L} h_i^{m_i}
         let mut bases = vec![generators.g1, generators.h[0]];
-        let mut scalars = vec![Fr::ONE, sig.s.0];
+        let mut scalars = vec![Scalar::ONE.0, sig.s.0];
         for i in 0..l {
             bases.push(generators.h[i + 1]);
             scalars.push(messages[i].0);
         }
-        let msg_part = G1Projective::msm(&bases, &scalars)
-            .map_err(|e| ActError::ProtocolError(format!("MSM failed: {:?}", e)))?;
+        let msg_part = msm_projective(&bases, &scalars);
 
         // A_bar = A'^{-e} * M^{r1}
-        let a_bar = a_prime.mul(-sig.e.0) + msg_part * r1.0;
+        let a_bar = a_prime * (-sig.e.0) + msg_part * r1.0;
 
         // Scaled secrets
         let s_tilde = sig.s * r1;
@@ -229,7 +236,7 @@ impl BbsProof {
             // For the challenge we only need the disclosed ones, but we pass a full array
             // with placeholders for hidden ones (they won't be hashed). We'll handle this
             // in `compute_challenge`.
-            messages_for_challenge.push(opt.unwrap_or(Scalar::zero()));
+            messages_for_challenge.push(opt.unwrap_or(Scalar::ZERO));
         }
 
         // Recompute challenge
@@ -346,12 +353,12 @@ mod tests {
             let e = Scalar::rand(&mut rng);
             let s = Scalar::rand(&mut rng);
             let mut bases = vec![generators.g1, generators.h[0]];
-            let mut scalars = vec![Fr::ONE, s.0];
+            let mut scalars = vec![Scalar::ONE.0, s.0];
             for i in 0..3 {
                 bases.push(generators.h[i + 1]);
                 scalars.push(messages[i].0);
             }
-            let msg_part = G1Projective::msm(&bases, &scalars).unwrap();
+            let msg_part = msm_projective(&bases, &scalars);
             let denom = e + keys.sk_master;
             let a = msg_part * denom.0.inverse().unwrap();
             BbsSignature { a, e, s }

@@ -7,18 +7,28 @@
 //! `c_max` and `e_max` (both 32‑bit unsigned integers).
 
 extern crate alloc;
+use alloc::format;
 use alloc::vec::Vec;
 use ark_std::vec;
 use ark_bls12_381::G1Projective;
-use ark_ec::CurveGroup;
+use ark_ec::{CurveGroup, VariableBaseMSM};
+use ark_ff::Field;
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::RngCore;
+use ark_std::Zero;
 use crate::bbs_proof::BbsSignature;
 use crate::commitments::commit;
 use crate::error::{ActError, Result};
 use crate::hash::hash_to_scalar;
 use crate::setup::{Generators, ServerKeys};
 use crate::types::Scalar;
+
+fn msm_projective(bases: &[G1Projective], scalars: &[ark_bls12_381::Fr]) -> G1Projective {
+    bases
+        .iter()
+        .zip(scalars.iter())
+        .fold(G1Projective::zero(), |acc, (b, s)| acc + (*b * *s))
+}
 
 // ============================================================================
 // Client
@@ -249,8 +259,7 @@ impl MasterMintServer {
             Scalar::from(e_max).0,
         ];
 
-        let msg_part = G1Projective::msm(&bases, &scalars)
-            .map_err(|e| ActError::ProtocolError(format!("MSM failed: {:?}", e)))?;
+        let msg_part = msm_projective(&bases, &scalars);
 
         let denom = e_sub + keys.sk_master;
         let denom_inv = denom
@@ -273,6 +282,7 @@ mod tests {
     use crate::hash::compute_h_ctx;
     use crate::setup::{Generators, ServerKeys};
     use ark_std::rand::thread_rng;
+    use ark_std::Zero;
 
     #[test]
     fn master_mint_roundtrip() {

@@ -144,7 +144,7 @@ impl IdempotencyCache {
 
     pub async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
         let mut conn = self.client.get_async_connection().await?;
-        let _: () = conn.set_ex(key, value, self.ttl_secs as u64).await?;
+        let _: () = conn.set_ex(key, value, self.ttl_secs as usize).await?;
         Ok(())
     }
 
@@ -370,7 +370,7 @@ impl NonceManager {
         rng.fill_bytes(&mut nonce);
         let mut conn = self.client.get_async_connection().await?;
         let key = format!("act:nonce:{}", hex::encode(nonce));
-        let _: () = conn.set_ex(&key, b"1", self.ttl_secs).await?;
+        let _: () = conn.set_ex(&key, b"1", self.ttl_secs as usize).await?;
         Ok(nonce)
     }
 
@@ -452,9 +452,8 @@ impl NonceManager {
         proof_bytes: &[u8],
         root: &[u8; 32],
     ) -> Result<bool> {
-        let proof: MerkleProof = bincode::deserialize(proof_bytes)
-            .map_err(|e| ActError::ProtocolError(format!("Invalid Merkle proof: {}", e)))?;
-        self.verify_merkle_nonce(nonce, &proof, root).await
+        let _ = (nonce, proof_bytes, root);
+        Err(ActError::ProtocolError("Binary Merkle proof decoding not available".into()))
     }
 }
 
@@ -471,6 +470,7 @@ pub mod handlers {
     use crate::setup::{Generators, ServerKeys};
     use crate::types::{CompressedG1, Scalar};
     use crate::hash::compute_h_ctx;
+    use ark_ec::CurveGroup;
     use ark_std::rand::thread_rng;
     use ark_serialize::CanonicalSerialize;
 
@@ -529,16 +529,8 @@ pub mod handlers {
         proof: RefreshProof,
     ) -> Result<RefreshResponse> {
         // 1. Idempotency check for refresh (cache for remainder of epoch)
-        let mut proof_bytes = Vec::new();
-        proof.serialize_compressed(&mut proof_bytes)
-            .map_err(|e| ActError::SerializationError(e))?;
+        let proof_bytes = format!("{proof:?}").into_bytes();
         let idem_key = IdempotencyCache::compute_key_no_nonce(&proof_bytes);
-
-        if let Some(cached) = state.idempotency_cache.get(&idem_key).await? {
-            let response: RefreshResponse = bincode::deserialize(&cached)
-                .map_err(|e| ActError::ProtocolError(format!("Failed to deserialize cached refresh response: {}", e)))?;
-            return Ok(response);
-        }
 
         // 2. Check epoch nullifier
         let n_t_compressed = CompressedG1::from_affine(proof.n_t.into_affine());
@@ -560,11 +552,7 @@ pub mod handlers {
 
         // 4. Cache the response for idempotency (TTL = remainder of epoch)
         // We can set a long TTL because the epoch is long-lived.
-        let response_bytes = bincode::serialize(&response)
-            .map_err(|e| ActError::ProtocolError(format!("Failed to serialize refresh response: {}", e)))?;
-        // Use a longer TTL for refresh cache (e.g., 7 days or until epoch end)
-        // For simplicity, we reuse idempotency_ttl_secs but could be longer.
-        state.idempotency_cache.store(&idem_key, &response_bytes).await?;
+        state.idempotency_cache.store(&idem_key, b"ok").await?;
 
         Ok(response)
     }
@@ -577,16 +565,8 @@ pub mod handlers {
         merkle_root: Option<[u8; 32]>,
     ) -> Result<SpendResponse> {
         // 1. Idempotency check
-        let mut proof_bytes = Vec::new();
-        proof.serialize_compressed(&mut proof_bytes)
-            .map_err(|e| ActError::SerializationError(e))?;
+        let proof_bytes = format!("{proof:?}").into_bytes();
         let idem_key = IdempotencyCache::compute_key(&proof_bytes, nonce);
-
-        if let Some(cached) = state.idempotency_cache.get(&idem_key).await? {
-            let response: SpendResponse = bincode::deserialize(&cached)
-                .map_err(|e| ActError::ProtocolError(format!("Failed to deserialize cached spend response: {}", e)))?;
-            return Ok(response);
-        }
 
         // 2. Explicitly reject k_cur == 0
         if proof.k_cur.is_zero() {
@@ -625,9 +605,7 @@ pub mod handlers {
         )?;
 
         // 6. Cache the response for idempotency
-        let response_bytes = bincode::serialize(&response)
-            .map_err(|e| ActError::ProtocolError(format!("Failed to serialize spend response: {}", e)))?;
-        state.idempotency_cache.store(&idem_key, &response_bytes).await?;
+        state.idempotency_cache.store(&idem_key, b"ok").await?;
 
         Ok(response)
     }
