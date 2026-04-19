@@ -15,6 +15,7 @@ use ark_bls12_381::{Bls12_381, Fq12, G1Projective};
 use ark_ec::{pairing::Pairing, CurveGroup, VariableBaseMSM};
 use ark_ff::Field;
 use ark_std::rand::thread_rng;
+use rand::RngCore;
 
 use act::{
     bulletproofs::{prove_range, verify_range},
@@ -227,7 +228,8 @@ fn performance_profile() {
 
     let (_daily_sig_base, k_daily) = last_daily.unwrap();
     let spend_amount = 30u32;
-    let nonce = [0x42u8; 16];
+    let mut nonce = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut nonce);
 
     let (mut st_sp, mut st_sv) = (Stats::new(), Stats::new());
     let mut last_sp: Option<act::spend::SpendProof> = None;
