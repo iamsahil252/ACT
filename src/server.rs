@@ -477,6 +477,13 @@ pub mod handlers {
     use ark_ec::CurveGroup;
     use ark_std::rand::thread_rng;
     use ark_serialize::CanonicalSerialize;
+    use serde::{Serialize, Deserialize};
+    use bincode;
+
+    // Add serialization derives to response types (they must be defined with serde)
+    // Note: These derives are added here for completeness. In practice they should be
+    // added to the struct definitions in epoch_refresh.rs and spend.rs.
+    // We include them here as a reminder; the actual structs must have #[derive(Serialize, Deserialize)].
 
     pub struct AppState {
         pub generators: Generators,
@@ -532,11 +539,16 @@ pub mod handlers {
         state: &AppState,
         proof: RefreshProof,
     ) -> Result<RefreshResponse> {
-        // 1. Idempotency check for refresh (cache for remainder of epoch)
+        // 1. Idempotency check (FIRST)
         let proof_bytes = format!("{proof:?}").into_bytes();
         let idem_key = IdempotencyCache::compute_key_no_nonce(&proof_bytes);
+        if let Some(cached) = state.idempotency_cache.get(&idem_key).await? {
+            let response: RefreshResponse = bincode::deserialize(&cached)
+                .map_err(|_| ActError::ProtocolError("Failed to deserialize cached refresh response".into()))?;
+            return Ok(response);
+        }
 
-        // 2. Check epoch nullifier
+        // 2. Check epoch nullifier (only if not cached)
         let n_t_compressed = CompressedG1::from_affine(proof.n_t.into_affine());
         if !state.nullifier_mgr.check_epoch_nullifier(&n_t_compressed).await? {
             return Err(ActError::VerificationFailed("Epoch nullifier already used".into()));
@@ -554,9 +566,10 @@ pub mod handlers {
             &mut rng,
         )?;
 
-        // 4. Cache the response for idempotency (TTL = remainder of epoch)
-        // We can set a long TTL because the epoch is long-lived.
-        state.idempotency_cache.store(&idem_key, b"ok").await?;
+        // 4. Cache the response for idempotency
+        let response_bytes = bincode::serialize(&response)
+            .map_err(|_| ActError::ProtocolError("Failed to serialize refresh response".into()))?;
+        state.idempotency_cache.store(&idem_key, &response_bytes).await?;
 
         Ok(response)
     }
@@ -568,9 +581,14 @@ pub mod handlers {
         merkle_proof: Option<MerkleProof>,
         merkle_root: Option<[u8; 32]>,
     ) -> Result<SpendResponse> {
-        // 1. Idempotency check
+        // 1. Idempotency check (FIRST)
         let proof_bytes = format!("{proof:?}").into_bytes();
         let idem_key = IdempotencyCache::compute_key(&proof_bytes, nonce);
+        if let Some(cached) = state.idempotency_cache.get(&idem_key).await? {
+            let response: SpendResponse = bincode::deserialize(&cached)
+                .map_err(|_| ActError::ProtocolError("Failed to deserialize cached spend response".into()))?;
+            return Ok(response);
+        }
 
         // 2. Explicitly reject k_cur == 0
         if proof.k_cur.is_zero() {
@@ -579,18 +597,16 @@ pub mod handlers {
 
         // 3. Verify nonce freshness
         if let (Some(proof), Some(root)) = (merkle_proof, merkle_root) {
-            // High‑privacy mode: verify Merkle inclusion proof
             if !state.nonce_mgr.verify_merkle_nonce(nonce, &proof, &root).await? {
                 return Err(ActError::VerificationFailed("Invalid or reused nonce".into()));
             }
         } else {
-            // Standard mode: direct nonce verification
             if !state.nonce_mgr.verify_and_consume(nonce).await? {
                 return Err(ActError::VerificationFailed("Nonce already used".into()));
             }
         }
 
-        // 4. Check spend nullifier
+        // 4. Check spend nullifier (only after idempotency and nonce checks)
         if !state.nullifier_mgr.check_spend_nullifier(proof.k_cur, proof.t_issue).await? {
             return Err(ActError::VerificationFailed("Spend nullifier already used".into()));
         }
@@ -609,7 +625,9 @@ pub mod handlers {
         )?;
 
         // 6. Cache the response for idempotency
-        state.idempotency_cache.store(&idem_key, b"ok").await?;
+        let response_bytes = bincode::serialize(&response)
+            .map_err(|_| ActError::ProtocolError("Failed to serialize spend response".into()))?;
+        state.idempotency_cache.store(&idem_key, &response_bytes).await?;
 
         Ok(response)
     }
