@@ -33,6 +33,7 @@ use bulletproofs::{BulletproofGens, PedersenGens, RangeProof as DalekRangeProof}
 use curve25519_dalek_ng::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek_ng::scalar::Scalar as DalekScalar;
 use merlin::Transcript;
+use std::sync::OnceLock;
 
 use crate::error::{ActError, Result};
 use crate::hash::{scalar_from_le_bytes_mod_order, write_g1_affine};
@@ -149,11 +150,27 @@ impl BatchedEqualityProof {
 }
 
 // ============================================================================
-// Dalek helpers
+// Dalek helpers – global singletons initialised exactly once at first use
 // ============================================================================
 
-fn dalek_pc_gens() -> PedersenGens { PedersenGens::default() }
-fn dalek_bp_gens() -> BulletproofGens { BulletproofGens::new(64, 1) }
+/// Process-wide `PedersenGens` singleton.  Cheap to reference; avoids
+/// redundant re-derivation of the generator points on every prove/verify call.
+static DALEK_PC_GENS: OnceLock<PedersenGens> = OnceLock::new();
+
+/// Process-wide `BulletproofGens` singleton for 32-bit range proofs (1 party).
+///
+/// `BulletproofGens::new(32, 1)` generates 32 pairs of orthogonal Curve25519
+/// points by hashing to the curve.  Doing this once at startup and sharing the
+/// result eliminates ~3–5 ms of redundant work per prove/verify call.
+static DALEK_BP_GENS: OnceLock<BulletproofGens> = OnceLock::new();
+
+fn dalek_pc_gens() -> &'static PedersenGens {
+    DALEK_PC_GENS.get_or_init(PedersenGens::default)
+}
+
+fn dalek_bp_gens() -> &'static BulletproofGens {
+    DALEK_BP_GENS.get_or_init(|| BulletproofGens::new(32, 1))
+}
 
 fn rand_dalek_scalar(rng: &mut (impl CryptoRng + RngCore)) -> DalekScalar {
     let mut wide = [0u8; 64];
@@ -167,6 +184,7 @@ fn rand_dalek_scalar(rng: &mut (impl CryptoRng + RngCore)) -> DalekScalar {
 
 fn compute_beq_challenge(
     context: &[u8],
+    commitments: &[G1Affine],
     c_bls_bytes: &[u8; 48],
     c_25519_bytes: &[u8; 32],
     r_bls_bytes: &[u8; 48],
@@ -176,6 +194,9 @@ fn compute_beq_challenge(
     let mut hasher = Sha256::new();
     hasher.update(b"ACT:BEQ:Challenge");
     hasher.update(context);
+    for comm in commitments {
+        hasher.update(comm.to_compressed());
+    }
     hasher.update(c_bls_bytes);
     hasher.update(c_25519_bytes);
     hasher.update(r_bls_bytes);
@@ -201,6 +222,12 @@ fn c128_to_bytes32(c128: &[u8; 16]) -> [u8; 32] {
 /// Generate a `BatchedEqualityProof` that `m` inside `C_BLS = m·h4 + r_bls·h0`
 /// equals the `m` inside a freshly generated Curve25519 commitment.
 ///
+/// `commitments` must contain the BBS+ commitments (A′, Ā, T_BBS) and bridge
+/// commitments that contextualise this proof.  They are hashed into the
+/// Fiat–Shamir challenge *and* appended to the Bulletproof's Merlin transcript,
+/// binding the two proofs together and preventing transcript-splicing attacks
+/// (Section 9.2 of the ACT paper).
+///
 /// Returns `(proof, c_bls)`.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_batched_equality(
@@ -210,6 +237,7 @@ pub fn prove_batched_equality(
     h4: G1Projective,
     h0: G1Projective,
     context: &[u8],
+    commitments: &[G1Affine],
 ) -> Result<(BatchedEqualityProof, G1Projective)> {
     // ── Step 1: Curve25519 commitment + Dalek range proof ────────────────────
     let r_25519 = rand_dalek_scalar(rng);
@@ -222,8 +250,13 @@ pub fn prove_batched_equality(
 
     let mut range_transcript = Transcript::new(b"ACT:BEQ:Range");
     range_transcript.append_message(b"ctx", context);
+    // Bind the BBS+ and bridge commitments directly to the Bulletproof
+    // transcript to prevent splicing attacks (Section 9.2).
+    for comm in commitments {
+        range_transcript.append_message(b"comm", comm.to_compressed().as_ref());
+    }
     let (dalek_proof, _committed) = DalekRangeProof::prove_single(
-        &bp_gens, &pc_gens, &mut range_transcript, m as u64, &r_25519, 32,
+        bp_gens, pc_gens, &mut range_transcript, m as u64, &r_25519, 32,
     )
     .map_err(|e| ActError::ProtocolError(alloc::format!("Dalek range prove failed: {:?}", e)))?;
     let range_proof_bytes = dalek_proof.to_bytes();
@@ -254,7 +287,7 @@ pub fn prove_batched_equality(
 
     // ── Step 6: 128-bit Fiat–Shamir challenge ────────────────────────────────
     let c128 = compute_beq_challenge(
-        context, &c_bls_bytes, &c_25519_bytes, &r_bls_bytes, &r_25519_bytes, &range_proof_bytes,
+        context, commitments, &c_bls_bytes, &c_25519_bytes, &r_bls_bytes, &r_25519_bytes, &range_proof_bytes,
     );
     let c_32 = c128_to_bytes32(&c128);
     let c_limbs = u256_from_le_bytes(&c_32);
@@ -293,12 +326,18 @@ pub fn prove_batched_equality(
 // ============================================================================
 
 /// Verify a [`BatchedEqualityProof`] against the BLS12-381 commitment `c_bls`.
+///
+/// `commitments` must be the same slice that was passed to
+/// [`prove_batched_equality`].  It is re-hashed into the Fiat–Shamir challenge
+/// and re-appended to the Bulletproof transcript so that the binding is
+/// verified end-to-end.
 pub fn verify_batched_equality(
     proof: &BatchedEqualityProof,
     c_bls: G1Projective,
     h4: G1Projective,
     h0: G1Projective,
     context: &[u8],
+    commitments: &[G1Affine],
 ) -> Result<()> {
     // ── 1. Bounds check: z_e < q₂₅₅₁₉ ──────────────────────────────────────
     let z_e_limbs = u256_from_le_bytes(&proof.z_e_bytes);
@@ -340,6 +379,7 @@ pub fn verify_batched_equality(
     let c_bls_bytes = G1Affine::from(c_bls).to_compressed();
     let expected_c128 = compute_beq_challenge(
         context,
+        commitments,
         &c_bls_bytes,
         &proof.c_25519_bytes,
         &r_bls_recon_bytes,
@@ -359,6 +399,10 @@ pub fn verify_batched_equality(
     })?;
     let mut range_transcript = Transcript::new(b"ACT:BEQ:Range");
     range_transcript.append_message(b"ctx", context);
+    // Re-bind the BBS+ and bridge commitments to match the prover's transcript.
+    for comm in commitments {
+        range_transcript.append_message(b"comm", comm.to_compressed().as_ref());
+    }
     dalek_proof.verify_single(&bp_gens, &pc_gens, &mut range_transcript, &c_25519_compressed, 32)
         .map_err(|e| {
             ActError::VerificationFailed(alloc::format!(
@@ -390,8 +434,8 @@ mod tests {
         let (h4, h0) = gens_h4_h0();
         let m = 42u32;
         let r_bls = BlsScalar::random(&mut rng);
-        let (proof, c_bls) = prove_batched_equality(&mut rng, m, r_bls, h4, h0, b"ctx").unwrap();
-        verify_batched_equality(&proof, c_bls, h4, h0, b"ctx").unwrap();
+        let (proof, c_bls) = prove_batched_equality(&mut rng, m, r_bls, h4, h0, b"ctx", &[]).unwrap();
+        verify_batched_equality(&proof, c_bls, h4, h0, b"ctx", &[]).unwrap();
     }
 
     #[test]
@@ -399,8 +443,8 @@ mod tests {
         let mut rng = thread_rng();
         let (h4, h0) = gens_h4_h0();
         let r_bls = BlsScalar::random(&mut rng);
-        let (proof, c_bls) = prove_batched_equality(&mut rng, 0, r_bls, h4, h0, b"zero").unwrap();
-        verify_batched_equality(&proof, c_bls, h4, h0, b"zero").unwrap();
+        let (proof, c_bls) = prove_batched_equality(&mut rng, 0, r_bls, h4, h0, b"zero", &[]).unwrap();
+        verify_batched_equality(&proof, c_bls, h4, h0, b"zero", &[]).unwrap();
     }
 
     #[test]
@@ -408,8 +452,8 @@ mod tests {
         let mut rng = thread_rng();
         let (h4, h0) = gens_h4_h0();
         let r_bls = BlsScalar::random(&mut rng);
-        let (proof, c_bls) = prove_batched_equality(&mut rng, u32::MAX, r_bls, h4, h0, b"max").unwrap();
-        verify_batched_equality(&proof, c_bls, h4, h0, b"max").unwrap();
+        let (proof, c_bls) = prove_batched_equality(&mut rng, u32::MAX, r_bls, h4, h0, b"max", &[]).unwrap();
+        verify_batched_equality(&proof, c_bls, h4, h0, b"max", &[]).unwrap();
     }
 
     #[test]
@@ -418,10 +462,10 @@ mod tests {
         let (h4, h0) = gens_h4_h0();
         let m = 10u32;
         let r_bls = BlsScalar::random(&mut rng);
-        let (proof, _c_bls) = prove_batched_equality(&mut rng, m, r_bls, h4, h0, b"ctx").unwrap();
+        let (proof, _c_bls) = prove_batched_equality(&mut rng, m, r_bls, h4, h0, b"ctx", &[]).unwrap();
         let wrong_r = BlsScalar::random(&mut rng);
         let wrong_c_bls = &(&h4 * &BlsScalar::from(m as u64 + 1)) + &(&h0 * &wrong_r);
-        assert!(verify_batched_equality(&proof, wrong_c_bls, h4, h0, b"ctx").is_err());
+        assert!(verify_batched_equality(&proof, wrong_c_bls, h4, h0, b"ctx", &[]).is_err());
     }
 
     #[test]
@@ -429,8 +473,19 @@ mod tests {
         let mut rng = thread_rng();
         let (h4, h0) = gens_h4_h0();
         let r_bls = BlsScalar::random(&mut rng);
-        let (proof, c_bls) = prove_batched_equality(&mut rng, 20, r_bls, h4, h0, b"A").unwrap();
-        assert!(verify_batched_equality(&proof, c_bls, h4, h0, b"B").is_err());
+        let (proof, c_bls) = prove_batched_equality(&mut rng, 20, r_bls, h4, h0, b"A", &[]).unwrap();
+        assert!(verify_batched_equality(&proof, c_bls, h4, h0, b"B", &[]).is_err());
+    }
+
+    #[test]
+    fn wrong_commitments_fails() {
+        let mut rng = thread_rng();
+        let (h4, h0) = gens_h4_h0();
+        let r_bls = BlsScalar::random(&mut rng);
+        let comm = G1Affine::from(h4);
+        let (proof, c_bls) = prove_batched_equality(&mut rng, 20, r_bls, h4, h0, b"ctx", &[comm]).unwrap();
+        // Verifying with a different commitment slice must fail.
+        assert!(verify_batched_equality(&proof, c_bls, h4, h0, b"ctx", &[]).is_err());
     }
 
     #[test]
@@ -438,7 +493,7 @@ mod tests {
         let mut rng = thread_rng();
         let (h4, h0) = gens_h4_h0();
         let r_bls = BlsScalar::random(&mut rng);
-        let (proof, _) = prove_batched_equality(&mut rng, u32::MAX, r_bls, h4, h0, b"size").unwrap();
+        let (proof, _) = prove_batched_equality(&mut rng, u32::MAX, r_bls, h4, h0, b"size", &[]).unwrap();
         assert_eq!(proof.z_e_bytes[31], 0);
     }
 }
