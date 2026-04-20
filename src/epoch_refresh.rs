@@ -7,7 +7,8 @@ use blstrs::{Bls12, G1Affine, G1Projective, G2Projective, Gt, Scalar as BlsScala
 use ff::Field as _;
 use group::Group as _;
 use pairing::{MultiMillerLoop as _, MillerLoopResult as _};
-use rand_core::{CryptoRng, RngCore};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{CryptoRng, RngCore, SeedableRng as _};
 use sha2::{Digest as _, Sha256};
 use std::io::Write as _;
 
@@ -102,24 +103,30 @@ impl RefreshProver {
         }
         let delta = e_max - t;
 
+        // Seed a ChaCha20Rng from 32 bytes of OS/caller entropy.
+        // All blinder scalars are generated from this fast SIMD PRNG.
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let mut fast_rng = ChaCha20Rng::from_seed(seed);
+
         // Epoch nullifier
         let h_t = hash_to_g1(b"ACT:Epoch:", &t.to_le_bytes());
         let n_t  = &h_t * &k_sub.0;
 
         // Daily commitment
-        let k_daily   = Scalar::rand_nonzero(rng);
-        let r_daily   = Scalar::rand(rng);
+        let k_daily   = Scalar::rand_nonzero(&mut fast_rng);
+        let r_daily   = Scalar::rand(&mut fast_rng);
         let k_daily_commit = &(&(&generators.h[4] * &Scalar::from(c_max).0)
             + &(&generators.h[1] * &k_daily.0))
             + &(&(&generators.h[2] * &Scalar::from(t).0)
             + &(&generators.h[0] * &r_daily.0));
 
         // Expiry commitment
-        let r_delta = Scalar::rand(rng);
+        let r_delta = Scalar::rand(&mut fast_rng);
         let c_delta = &(&generators.h[3] * &Scalar::from(delta).0) + &(&generators.h[0] * &r_delta.0);
 
         // BBS+ randomization
-        let r1      = Scalar::rand_nonzero(rng);
+        let r1      = Scalar::rand_nonzero(&mut fast_rng);
         let a_prime = &master.a * &r1.0;
 
         let msg_part = g1_msm(
@@ -137,8 +144,8 @@ impl RefreshProver {
 
         // BBS+ blinders
         let (rho_e, rho_r1, rho_s, rho_k, rho_c, rho_e_msg) = (
-            Scalar::rand(rng), Scalar::rand(rng), Scalar::rand(rng),
-            Scalar::rand(rng), Scalar::rand(rng), Scalar::rand(rng),
+            Scalar::rand(&mut fast_rng), Scalar::rand(&mut fast_rng), Scalar::rand(&mut fast_rng),
+            Scalar::rand(&mut fast_rng), Scalar::rand(&mut fast_rng), Scalar::rand(&mut fast_rng),
         );
 
         let a_prime_aff = G1Affine::from(a_prime);
@@ -149,7 +156,9 @@ impl RefreshProver {
         );
 
         // External blinders
-        let (rho_u, rho_v, rho_w) = (Scalar::rand(rng), Scalar::rand(rng), Scalar::rand(rng));
+        let (rho_u, rho_v, rho_w) = (
+            Scalar::rand(&mut fast_rng), Scalar::rand(&mut fast_rng), Scalar::rand(&mut fast_rng),
+        );
 
         // Bridging commitments
         let t_scale_n = &n_t * &rho_r1.0;
@@ -178,7 +187,7 @@ impl RefreshProver {
         beq_ctx.extend_from_slice(&G1Affine::from(t_bbs).to_compressed());
 
         let (batched_eq, c_delta_from_beq) = prove_batched_equality(
-            rng, delta, r_delta.0, generators.h[3], generators.h[0], &beq_ctx,
+            &mut fast_rng, delta, r_delta.0, generators.h[3], generators.h[0], &beq_ctx,
         )?;
         debug_assert_eq!(c_delta, c_delta_from_beq, "c_delta mismatch");
         let beq_bytes = batched_eq.to_bytes();

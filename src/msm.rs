@@ -35,6 +35,32 @@ pub fn batch_normalize(points: &[G1Projective]) -> Vec<G1Affine> {
     points.iter().map(G1Affine::from).collect()
 }
 
+/// Multiply a G1 point by a 32-bit unsigned scalar using a 32-iteration
+/// double-and-add loop.
+///
+/// For small scalars (spend amounts, epoch numbers) this avoids the full
+/// 256-bit scalar-multiplication loop and runs ≈ 8× faster.
+#[inline]
+pub fn g1_mul_u32(point: G1Projective, scalar: u32) -> G1Projective {
+    if scalar == 0 {
+        return G1Projective::identity();
+    }
+    if scalar == 1 {
+        return point;
+    }
+    let mut result = G1Projective::identity();
+    let mut addend = point;
+    let mut n = scalar;
+    while n > 0 {
+        if n & 1 == 1 {
+            result = &result + &addend;
+        }
+        addend = &addend + &addend;
+        n >>= 1;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +98,16 @@ mod tests {
         let expected = &(&g * &s1) + &(&g * &s2);
         let result = g1_msm(&[g_aff, g_aff], &[s1, s2]);
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn g1_mul_u32_matches_scalar_mul() {
+        use blstrs::Scalar as BlsScalar;
+        let g = G1Projective::generator();
+        for &n in &[0u32, 1, 2, 7, 30, 100, 5000, u32::MAX] {
+            let expected = &g * &BlsScalar::from(n as u64);
+            let got = g1_mul_u32(g, n);
+            assert_eq!(got, expected, "mismatch at n={n}");
+        }
     }
 }

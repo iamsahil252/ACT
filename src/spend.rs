@@ -7,7 +7,8 @@ use blstrs::{Bls12, G1Affine, G1Projective, G2Projective, Gt, Scalar as BlsScala
 use ff::Field as _;
 use group::Group as _;
 use pairing::{MultiMillerLoop as _, MillerLoopResult as _};
-use rand_core::{CryptoRng, RngCore};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{CryptoRng, RngCore, SeedableRng as _};
 use sha2::{Digest as _, Sha256};
 use std::io::Write as _;
 
@@ -94,20 +95,27 @@ impl SpendProver {
         }
         let m = c_bal - spend_amount;
 
+        // Seed a ChaCha20Rng from 32 bytes of OS/caller entropy.
+        // This makes all subsequent blinder generation virtually free (SIMD stream)
+        // while still being cryptographically secure.
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let mut fast_rng = ChaCha20Rng::from_seed(seed);
+
         // Refund commitment K' = m·h4 + k_star·h1 + T_issue·h2 + r_star·h0
-        let k_star = Scalar::rand_nonzero(rng);
-        let r_star = Scalar::rand(rng);
+        let k_star = Scalar::rand_nonzero(&mut fast_rng);
+        let r_star = Scalar::rand(&mut fast_rng);
         let k_prime = &(&(&generators.h[4] * &Scalar::from(m).0)
             + &(&generators.h[1] * &k_star.0))
             + &(&(&generators.h[2] * &Scalar::from(t_issue).0)
             + &(&generators.h[0] * &r_star.0));
 
         // Range proof commitment C_BP = m·h4 + r_bp·h0
-        let r_bp  = Scalar::rand(rng);
+        let r_bp  = Scalar::rand(&mut fast_rng);
         let c_bp  = &(&generators.h[4] * &Scalar::from(m).0) + &(&generators.h[0] * &r_bp.0);
 
         // BBS+ randomization
-        let r1      = Scalar::rand_nonzero(rng);
+        let r1      = Scalar::rand_nonzero(&mut fast_rng);
         let a_prime = &token.a * &r1.0;
 
         let msg_part = g1_msm(
@@ -122,7 +130,8 @@ impl SpendProver {
         let c_tilde = Scalar::from(c_bal) * r1;
 
         let (rho_e, rho_r1, rho_s, rho_c) = (
-            Scalar::rand(rng), Scalar::rand(rng), Scalar::rand(rng), Scalar::rand(rng),
+            Scalar::rand(&mut fast_rng), Scalar::rand(&mut fast_rng),
+            Scalar::rand(&mut fast_rng), Scalar::rand(&mut fast_rng),
         );
 
         let a_prime_aff = G1Affine::from(a_prime);
@@ -133,7 +142,9 @@ impl SpendProver {
               (k_cur * rho_r1).0, (Scalar::from(t_issue) * rho_r1).0],
         );
 
-        let (rho_u, rho_v, rho_w) = (Scalar::rand(rng), Scalar::rand(rng), Scalar::rand(rng));
+        let (rho_u, rho_v, rho_w) = (
+            Scalar::rand(&mut fast_rng), Scalar::rand(&mut fast_rng), Scalar::rand(&mut fast_rng),
+        );
 
         let c_total  = &k_prime + &(&generators.h[4] * &Scalar::from(spend_amount).0);
         let t_scale_t = &c_total  * &rho_r1.0;
@@ -171,7 +182,7 @@ impl SpendProver {
         beq_ctx.extend_from_slice(&G1Affine::from(t_bbs).to_compressed());
 
         let (batched_eq, c_bp_from_beq) = prove_batched_equality(
-            rng, m, r_bp.0, generators.h[4], generators.h[0], &beq_ctx,
+            &mut fast_rng, m, r_bp.0, generators.h[4], generators.h[0], &beq_ctx,
         )?;
         debug_assert_eq!(c_bp, c_bp_from_beq, "c_bp mismatch");
         let beq_bytes = batched_eq.to_bytes();
