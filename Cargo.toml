@@ -13,9 +13,6 @@ categories = ["cryptography", "web-programming::http-client"]
 [features]
 default = ["std"]
 std = ["dep:rayon"]
-# Enable AVX2-vectorised Ristretto arithmetic in curve25519-dalek-ng.
-# Requires a nightly Rust toolchain (the upstream crate uses packed_simd_2).
-simd_backend = ["curve25519-dalek-ng/simd_backend"]
 server = ["dep:redis", "dep:tokio", "dep:axum", "dep:bincode", "dep:tower", "dep:tower-http"]
 
 [dependencies]
