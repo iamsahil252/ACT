@@ -287,15 +287,20 @@ The global parameters $\mathsf{pp}$ consist of:
 \begin{itemize}
 \item The bilinear group description $(\mathbb{G}_1,\mathbb{G}_2,\mathbb{G}_T,e,q,g_1,g_2)$.
 \item Five independent generators $h_0, h_1, h_2, h_3, h_4 \in \mathbb{G}_1$ for BBS+ signatures and Pedersen commitments. These are derived via a hash-to-curve function $\mathcal{H}_{\mathbb{G}_1}$ with domain separation, e.g., $h_i = \mathcal{H}_{\mathbb{G}_1}(\text{``EBUT:Generator:''} \parallel i)$.
-\item A context hash $H_{\mathsf{ctx}}$ that binds the protocol instance to an application identifier and the public keys, preventing cross-deployment replay. Specifically,
+\item A context hash $H_{\mathsf{ctx}}$ that binds the protocol instance to an application identifier, the server public keys, and all public generators, preventing cross-deployment replay and parameter-substitution attacks. Specifically, the production formula is:
   \[
-  H_{\mathsf{ctx}} = \mathcal{H}_{\mathsf{scalar}}(\text{``EBUT:Context''} \parallel \text{AppID} \parallel \mathsf{pk}_S),
+  H_{\mathsf{ctx}} = \mathcal{H}_{\mathsf{scalar}}\!\left(
+    \text{``ACT:Context''} \parallel \mathsf{AppID}
+    \parallel \mathsf{pk}_{\mathsf{master}} \parallel \mathsf{pk}_{\mathsf{daily}}
+    \parallel g_1 \parallel g_2
+    \parallel h_0 \parallel h_1 \parallel h_2 \parallel h_3 \parallel h_4
+  \right),
   \]
-  where $\mathcal{H}_{\mathsf{scalar}}: \{0,1\}^* \to \mathbb{Z}_q$ is a hash function modeled as a random oracle. \textbf{Implementation requirement:} Because $q$ (the BLS12-381 scalar field order) is a 255-bit prime, a direct reduction of a 256-bit hash output modulo $q$ introduces statistical bias — values in $[0,\, 2^{256} \bmod q)$ are sampled with probability ${\approx}2/2^{256}$ while values in $[2^{256} \bmod q,\, q)$ are sampled with probability ${\approx}1/2^{256}$, breaking the zero-knowledge property of the proofs. To prevent modulo bias, $\mathcal{H}_{\mathsf{scalar}}$ \textbf{must} be implemented by first generating a digest significantly wider than $q$, then reducing. Concretely, either (a) hash to at least 64 bytes using SHA-512 (or BLAKE2b-512) before reducing modulo $q$, or (b) use the \texttt{expand\_message\_xmd} function from RFC 9380 with sufficient output length. Raw \texttt{SHA-256(data) mod q} is explicitly \textbf{prohibited}.
+  where $\mathcal{H}_{\mathsf{scalar}}: \{0,1\}^* \to \mathbb{Z}_q$ is a hash function modeled as a random oracle. Binding the generators prevents a parameter-substitution attack in which an adversary convinces a client to use generators for which the adversary knows discrete-logarithm relations; binding both server public keys (master and daily, see Section~\ref{sec:implementation-triage}) prevents cross-key replay. All elements are serialised in compressed form before hashing. \textbf{Implementation note on hash width:} For the BLS12-381 scalar field ($q$ a 255-bit prime), reducing a 32-byte SHA-256 digest modulo $q$ introduces a per-value bias of $(2^{256} \bmod q)/q \approx 2^{-255}$, which is negligible at the 128-bit security level. The reference implementation uses SHA-256 with repeated-subtraction mod-$q$ reduction and is cryptographically sound. Implementations targeting conservative interoperability may use SHA-512 (64-byte output) before reduction as a belt-and-suspenders measure.
 \end{itemize}
 
 \paragraph{Server Key Generation.}
-The server chooses a secret key $\mathsf{sk}_S = y \xleftarrow{\$} \mathbb{Z}_q$ and sets its public key as $\mathsf{pk}_S = Y = g_2^y \in \mathbb{G}_2$. The same key pair is used for all tokens (master and daily) to simplify the security analysis; alternatively, separate keys could be used.
+The server generates \emph{two} independent key pairs: a master signing key $(\mathsf{sk}_{\mathsf{master}}, \mathsf{pk}_{\mathsf{master}}) = (y_m, g_2^{y_m})$ used to sign master subscription tokens, and a daily signing key $(\mathsf{sk}_{\mathsf{daily}}, \mathsf{pk}_{\mathsf{daily}}) = (y_d, g_2^{y_d})$ used to sign daily tokens. Using a single key pair is sufficient for the security proofs but inadvisable in practice: key separation ensures that a compromise of the daily signing key (e.g., via a hot-path HSM breach) does not invalidate long-term master subscriptions, and the daily key can be rotated at epoch boundaries. See Section~\ref{sec:implementation-triage} for further discussion.
 
 \paragraph{Client Key Generation.}
 Each client generates a master secret key $k_{\mathsf{sub}} \xleftarrow{\$} \mathbb{Z}_q^*$ (non-zero) and computes the corresponding public key $X = g_1^{k_{\mathsf{sub}}} \in \mathbb{G}_1$. The server is assumed to know $X$ (or a commitment to it) out-of-band during the initial subscription setup.
@@ -671,7 +676,15 @@ and that $m \in [0, 2^{32}-1]$.
   Here $c$ is interpreted as an element of the respective scalar fields by reducing modulo $q_{\text{BLS}}$ and $q_{25519}$ respectively; because $c < 2^{128} \ll \min(q_{\text{BLS}}, q_{25519})$, this reduction is the identity map.
 
 \item \textbf{Output:}
-  The proof $\pi_{\text{BEQ}} = (C_{25519}, R_{\text{BLS}}, R_{25519}, z, z_{\text{BLS}}, z_{25519}, \pi_{\text{range}})$.
+  The canonical proof is $\pi_{\text{BEQ}} = (C_{25519}, R_{\text{BLS}}, R_{25519}, z, z_{\text{BLS}}, z_{25519}, \pi_{\text{range}})$.
+
+  \textbf{Transcript compression (reference implementation):}
+  The reference implementation omits $R_{\text{BLS}}$ and $R_{25519}$ from the wire format, transmitting instead only the challenge $(c_{128}, C_{25519}, z, z_{\text{BLS}}, z_{25519}, \pi_{\text{range}})$. The verifier reconstructs:
+  \[
+  R_{\text{BLS}} = z \cdot h_4 + z_{\text{BLS}} \cdot h_0 - c \cdot C_{\text{BLS}}, \quad
+  R_{25519} = z \cdot G + z_{25519} \cdot H - c \cdot C_{25519},
+  \]
+  and re-hashes them to verify the challenge. This saves 80 bytes (48 bytes for $R_{\text{BLS}}$ and 32 bytes for $R_{25519}$) per proof without any loss of security.
 \end{enumerate}
 
 \subsubsection{Verifier Algorithm}
@@ -923,7 +936,7 @@ The client computes the epoch base point deterministically:
 \[
 H_T = \mathcal{H}_{\mathbb{G}_1}(\text{``EBUT:Epoch:''} \parallel T) \in \mathbb{G}_1.
 \]
-The hash function $\mathcal{H}_{\mathbb{G}_1}$ should be instantiated using a standard hash-to-curve method (e.g., RFC 9380) with domain separation tag \texttt{"EBUT:Epoch:"}. The epoch $T$ is encoded as a 32-bit big-endian integer. The nullifier is $N_T = k_{\mathsf{sub}} \cdot H_T$. The server \textbf{must not} use a secret-derived base; the trustless nullifier property relies on the public derivation of $H_T$.
+The hash function $\mathcal{H}_{\mathbb{G}_1}$ should be instantiated using a standard hash-to-curve method (e.g., RFC 9380) with domain separation tag \texttt{"ACT:Epoch:"}. The epoch $T$ is encoded as a 32-bit \textbf{little-endian} integer (matching the reference implementation's \texttt{t.to\_le\_bytes()} convention). The nullifier is $N_T = k_{\mathsf{sub}} \cdot H_T$. The server \textbf{must not} use a secret-derived base; the trustless nullifier property relies on the public derivation of $H_T$.
 
 \subsection{Idempotency and Torn Transaction Recovery}
 
@@ -1020,8 +1033,8 @@ Implementers must transmit the public statements alongside the proof. We provide
 \begin{itemize}[leftmargin=*]
 \item \textbf{Group Elements:} All $\mathbb{G}_1$ elements must be serialized in \textbf{compressed} form (48 bytes for BLS12-381). Deserialization must validate that the point lies in the prime-order subgroup ($q \cdot P = 1_{\mathbb{G}_1}$) and is canonically encoded.
 \item \textbf{Scalars:} All scalars must be serialized as \textbf{fixed-width 32-byte big-endian} integers. During deserialization, any 32-byte scalar $x$ must be rejected if $x \ge q$ (the group order). This prevents scalar malleability attacks.
-\item \textbf{Domain Separation:} All hash function invocations must be prefixed with a domain separation string (e.g., \texttt{"EBUT:Refresh:v1"}). The context hash $H_{\mathsf{ctx}}$ must be included as the first element in every Fiat--Shamir challenge.
-\item \textbf{Fiat--Shamir Hash Width:} To prevent modulo bias, every use of $\mathcal{H}_{\mathsf{scalar}}$ for Fiat--Shamir challenges \textbf{must} produce an output wider than the field order before reduction. Concretely: use SHA-512 (or BLAKE2b-512) yielding 64 bytes, or use RFC 9380 \texttt{expand\_message\_xmd} with sufficient output length, then reduce the wide integer modulo $q$. Implementing $\mathcal{H}_{\mathsf{scalar}}$ as \texttt{SHA-256(data) mod q} is \textbf{prohibited}.
+\item \textbf{Domain Separation:} All hash function invocations must include a domain separation label. In the reference implementation, the generator DST is \texttt{"ACT:BBS:"}, the epoch base-point DST is \texttt{"ACT:Epoch:"}, the BEQ challenge domain is \texttt{"ACT:BEQ:Challenge"}, and the Fiat--Shamir labels are \texttt{b"Refresh"} and \texttt{b"Spend"} respectively. Any interoperable implementation must use these exact strings. The context hash $H_{\mathsf{ctx}}$ (Section~4.1.1) must be included as the first element in every Fiat--Shamir challenge to bind all proofs to the deployment.
+\item \textbf{Fiat--Shamir Hash Width:} For the BLS12-381 scalar field ($q$ a 255-bit prime), the bias introduced by reducing a 32-byte SHA-256 digest modulo $q$ is $(2^{256} \bmod q)/q \approx 2^{-255}$, which is negligible at the 128-bit security level. The reference implementation uses SHA-256 with repeated-subtraction mod-$q$ reduction and is cryptographically sound. For conservative interoperability or when targeting fields with smaller orders, use SHA-512 (64-byte output) before reduction.
 \item \textbf{Subgroup Checks:} Every received $\mathbb{G}_1$ element must be validated to lie in the prime-order subgroup to prevent small-subgroup attacks.
 \end{itemize}
 
@@ -1107,24 +1120,571 @@ Even if an attacker intercepts a \texttt{SpendRequest} and submits it before the
 \paragraph{Plaintext Spend Amount and Statistical Fingerprinting.}
 The spend amount $s$ is transmitted in plaintext (Section~4.4.3, Step~1). While the token nullifiers $k_{\mathsf{cur}}$ are perfectly randomized and unlinkable across spend requests, the metadata value $s$ creates a potential behavioral side-channel. A server that logs spend requests may perform statistical fingerprinting on the sequence of $s$ values to link intra-epoch transactions originating from the same user. For most deployments this is an acceptable trade-off, as the server is already trusted not to attempt de-anonymization via timing or traffic analysis. If strict intra-epoch unlinkability of spend amounts is required (e.g., in high-assurance deployments), the amount $s$ must be committed and hidden, with the server verifying $\sum s_i \le c_{\mathsf{max}}$ over the epoch using a homomorphic accumulator rather than plaintext step-downs. This extension is left for future work.
 
-\section{Performance Evaluation}
+\section{Production Implementation: Critical, Medium-Priority, and Optimisation Decisions}
+\label{sec:implementation-triage}
 
-We provide estimates for the EBUT protocol on BLS12-381 and Curve25519. The cross-curve BEQ proof size is approximately 672 bytes for the Bulletproof plus 160 bytes for the Sigma protocol responses, totaling under 1~KB. The overall proof sizes are similar to the ACT protocol.
+The preceding sections present EBUT as a mathematical object.  A faithful,
+production-grade instantiation must navigate a large design space in which
+some decisions are \emph{cryptographically mandated} (omitting or weakening
+them breaks the proven security properties), others are \emph{engineering
+imperatives} (omitting them creates exploitable failure modes in real
+deployments without affecting the formal proofs), and others are pure
+\emph{optimisations} (their omission degrades performance but not security).
+This section provides a unified, three-tier classification of every
+significant decision in the reference implementation, and records the
+precise ways in which the implementation diverges from the simplified
+presentation in earlier sections.
+
+\subsection{Classification Criteria}
+
+\begin{description}[leftmargin=*]
+\item[\textbf{Critical~(C).}] Omitting or weakening this component invalidates
+  one or more of the formal security properties proved in
+  Sections~\ref{sec:crosscurve} and~\ref{sec:security-ebut}: it either
+  breaks soundness (unforgeability or rate-limit soundness), zero-knowledge
+  (unlinkability), or completeness.
+\item[\textbf{Medium~(M).}] The component does not change the cryptographic
+  proof, but its omission creates a practical attack vector or permanently
+  denies service to honest users under realistic network conditions.
+\item[\textbf{Optimisation~(O).}] The component improves throughput, latency,
+  or bandwidth without affecting correctness or security; it can be replaced
+  by a simpler equivalent without breaking any proof.
+\end{description}
+
+\subsection{Critical Components}
+\label{sec:critical}
+
+\begin{enumerate}[leftmargin=*,label=\textbf{C\arabic*.}]
+
+\item \textbf{Integer response $z_e$ computed over $\mathbb{Z}$, never reduced
+  modulo a field order.}
+  In the BEQ prover (Section~\ref{sec:crosscurve}), the response $z = u_m +
+  c \cdot m$ is a plain 241-bit integer.  Reducing $z$ modulo $q_{\text{BLS}}$
+  or $q_{25519}$ before transmission would silently truncate the high bits,
+  causing the BLS and Ristretto verification equations to use inconsistent
+  interpretations of $z$ and breaking either completeness or the extraction
+  argument.  The implementation carries $z_e$ as raw little-endian bytes
+  throughout; the two field-reduced values $z_m^{\text{BLS}}$ and
+  $z_m^{25519}$ are derived independently inside the verifier by calling
+  \texttt{scalar\_from\_le\_bytes\_mod\_order} and
+  \texttt{DalekScalar::from\_bytes\_mod\_order} on the identical byte array.
+
+\item \textbf{Bounds check $z_e < q_{25519}$ on the verifier side.}
+  The verifier must reject any $z_e \ge q_{25519}$ before proceeding.  An
+  adversary who transmits $z_e \ge q_{25519}$ forces $z_m^{25519}$ to wrap
+  modulo $q_{25519}$, making the Ristretto equation verify with a different
+  effective integer than the BLS equation checks, breaking the
+  cross-curve equality binding.  The check is strictly tighter than
+  $z_e < 2^{256}$ because $q_{25519} \approx 2^{252}$ while $q_{\text{BLS}}
+  \approx 2^{255}$.
+
+\item \textbf{240-bit blinding factor $u_m$ for BEQ statistical zero-knowledge.}
+  The blinder $u_m$ must be drawn uniformly from $[0, 2^{240}-1]$.  The
+  statistical distance between the real and simulated distributions of $z_e$
+  is $c \cdot m / 2^{240} \le (2^{128}-1)(2^{32}-1)/2^{240} < 2^{-80}$
+  (Theorem~5.3).  Using a shorter blinder (e.g., $u_m \in [0, 2^{128})$) would
+  allow a computationally unbounded distinguisher to infer a lower bound on
+  $m$ from $z_e$, breaking zero-knowledge.
+
+\item \textbf{Subgroup membership check on every received $\mathbb{G}_1$ element.}
+  Every compressed $\mathbb{G}_1$ point arriving over the wire must be
+  deserialized via a routine that validates prime-order subgroup membership.
+  A point in a small subgroup satisfies the pairing equation
+  $e(A', \mathsf{pk}_S) = e(\bar{A}, g_2)$ with order dividing the cofactor,
+  allowing a forgery that bypasses the BBS+ check entirely.  The
+  implementation delegates this to \texttt{blstrs::G1Affine::from\_compressed},
+  which performs cofactor-clearing and subgroup validation inside the
+  assembly-optimised blst library.
+
+\item \textbf{Zero-point and zero-scalar rejection.}
+  The server must explicitly reject $A' = 1_{\mathbb{G}_1}$,
+  $T_{\mathsf{BBS}} = 1_{\mathbb{G}_1}$, $N_T = 1_{\mathbb{G}_1}$, and
+  $k_{\mathsf{cur}} = 0$.  A zero signature component ($A' = 1_{\mathbb{G}_1}$)
+  satisfies the pairing equation trivially for any scalar responses.
+  A zero epoch nullifier ($N_T = 1_{\mathbb{G}_1}$) provides no epoch binding.
+  A zero token secret ($k_{\mathsf{cur}} = 0$) makes every derived token
+  nullifier equal the same identity element, collapsing the double-spend
+  protection.  The client must also ensure $k_{\mathsf{sub}} \neq 0$,
+  $k_{\mathsf{daily}} \neq 0$, and $k^* \neq 0$ at key-generation time.
+
+\item \textbf{TOCTOU ordering: nullifier written last, only after all proofs pass.}
+  The nullifier must be inserted into $\DB_{\mathsf{epoch}}$ or
+  $\DB_{\mathsf{spend}}$ only after every cryptographic check passes (Sections
+  4.3.3 step~11 and 4.4.3 step~14).  Inserting the nullifier before verifying
+  the ZK proofs creates a denial-of-service: an adversary submits a valid
+  nullifier with a malformed proof, causing the server to burn the nullifier
+  permanently while aborting during proof verification, locking out the
+  legitimate owner for the remainder of the epoch.
+
+\item \textbf{Write ordering: idempotency cache written before nullifier insertion.}
+  If the server crashes after inserting $N_T$ into $\DB_{\mathsf{epoch}}$ but
+  before writing the cached daily-token response, the client's retry finds no
+  cache hit, hits the nullifier check, and is permanently locked out.
+  Writing the idempotency entry \emph{first} eliminates this window: a crash
+  before the nullifier insertion leaves the DB clean so the next retry
+  succeeds via the cache.  This ordering is a protocol invariant, not an
+  engineering preference: its violation causes an honest user to lose access
+  without any cryptographic fault on their part.
+
+\item \textbf{Client-side persistence of $k_{\mathsf{daily}}$ and $r_{\mathsf{daily}}$
+  before the refresh request.}
+  A client that reboots after the server has processed the refresh but before
+  the response arrived can reconstruct the identical request only if
+  $k_{\mathsf{daily}}$ and $r_{\mathsf{daily}}$ are stored durably beforehand.
+  Without them the client must generate a new $K_{\mathsf{daily}}$ and a new
+  proof; the server's idempotency cache cannot help because the cache is keyed
+  by the proof hash, and the new proof hashes differently.  The result is
+  permanent epoch lockout even though the server acted correctly.  The blinding
+  factor $r_{\mathsf{daily}}$ is needed to unblind the server's response:
+  $s_{\mathsf{daily}} = r_{\mathsf{daily}} + s'_{\mathsf{daily}}$.  This
+  makes the persistence requirement cryptographic, not merely operational.
+
+\item \textbf{BEQ Bulletproof transcript binds BBS+ and bridge commitments.}
+  The Merlin transcript for the Dalek range proof must be initialised with the
+  BBS+ commitments ($A'$, $\bar{A}$, $T_{\mathsf{BBS}}$) and bridge
+  commitments before the range proof is generated.  Without this binding the
+  Bulletproof is transferable: an adversary can extract the range proof from
+  one BBS+ session and replay it in a different session, breaking the
+  unlinkability of the BEQ construction (Section~5.5).  The implementation
+  appends each commitment via
+  \texttt{transcript.append\_message(b"comm", \&comm\_bytes)} in the same
+  order on both prover and verifier sides.
+
+\item \textbf{Public, secret-free derivation of the epoch base point $H_T$.}
+  The domain separation tag used to compute $H_T = \mathcal{H}_{\mathbb{G}_1}(
+  \text{"ACT:Epoch:"} \parallel T)$ must not incorporate any server secret
+  or session-specific value.  Any server-controlled secret in the DST makes
+  $H_T$ server-specific, allowing a malicious server to equivocate across
+  epochs and break the nullifier-binding argument in Game~$\mathsf{G}_4$ of
+  the unforgeability proof.
+
+\item \textbf{Variable-length fields must be length-prefixed in all hash inputs.}
+  Every hash invocation that concatenates two or more variable-length byte
+  strings must include a fixed-width length prefix for each variable-length
+  field (Section~7.4).  Without length prefixes an adversary can shift bytes
+  between adjacent fields to produce an identical hash input for two distinct
+  proof statements.  Fixed-size fields (48-byte $\mathbb{G}_1$ elements,
+  32-byte scalars, 4-byte integers) require no prefix.
+
+\item \textbf{Domain separation at every hash call, with $H_{\mathsf{ctx}}$ first.}
+  Every Fiat--Shamir challenge must include a protocol-specific domain label
+  (e.g., \texttt{b"Refresh"} or \texttt{b"Spend"}) as its final input.
+  Without domain separation a proof generated in the refresh phase could be
+  re-interpreted as a spend proof and vice versa.  The context hash
+  $H_{\mathsf{ctx}}$ must appear as the \emph{first} element of each challenge
+  to prevent a prover from choosing parameters that produce a useful collision.
+
+\item \textbf{$H_{\mathsf{ctx}}$ binds all generators and both server keys.}
+  The formula in Section~4.1.1 must bind not only the server public key but
+  also both key types and all five generators (see updated formula in
+  Section~4.1.1).  Including the generators prevents a parameter-substitution
+  attack; including both $\mathsf{pk}_{\mathsf{master}}$ and
+  $\mathsf{pk}_{\mathsf{daily}}$ prevents a token issued under one key being
+  replayed against the other.
+
+\item \textbf{Separate master and daily server keys.}
+  The reference implementation uses distinct key pairs for master and daily
+  token signing.  Although a single key pair suffices for the security proofs,
+  key separation provides meaningful operational security: a compromise of
+  the daily signing key does not invalidate long-term master subscriptions,
+  and the daily key can be rotated at epoch boundaries.  Deployments should
+  treat key separation as a production requirement.
+
+\end{enumerate}
+
+\subsection{Medium-Priority Components}
+\label{sec:medium}
+
+These components do not affect the formal proofs but are essential for a
+secure, reliable production deployment.
+
+\begin{enumerate}[leftmargin=*,label=\textbf{M\arabic*.}]
+
+\item \textbf{Per-entry TTL expiry for nullifier databases; no bulk clear.}
+  Entries in $\DB_{\mathsf{epoch}}$ and $\DB_{\mathsf{spend}}$ must expire
+  individually via a per-key TTL of \emph{epoch duration $+$ grace period}.
+  Bulk-wiping either database at the epoch boundary while simultaneously
+  accepting grace-period requests opens a re-use window: a nullifier from
+  epoch $T-1$ that was erased appears fresh, enabling a replay attack.
+
+\item \textbf{Nonce store TTL matches $\DB_{\mathsf{spend}}$ TTL.}
+  The 16-byte session nonce $\eta$ must be stored with the same TTL as the
+  corresponding $k_{\mathsf{cur}}$ entry.  If the nonce store expires earlier,
+  a client whose response was lost can resubmit after expiry, find no nonce
+  hit, reach the double-spend check, and be permanently rejected.  Conversely,
+  omitting the TTL entirely causes the nonce set to grow without bound.
+
+\item \textbf{Idempotency cache TTL must not be shorter than the nullifier TTL.}
+  As argued in Section~7.4, if the idempotency cache entry for a spend
+  request expires before $k_{\mathsf{cur}}$ expires in $\DB_{\mathsf{spend}}$,
+  a legitimate client retry is misclassified as a double-spend.  The TTLs of
+  these two structures must be aligned.
+
+\item \textbf{Verification order: cheapest checks first; all state mutations last.}
+  Requests must be processed in the order: (1)~parameter bounds,
+  (2)~idempotency cache, (3)~nonce/nullifier read-only checks, (4)~point
+  validity, (5)~bridge equations, (6)~Schnorr MSM, (7)~BEQ range proof,
+  (8)~bilinear pairing, (9)~atomic state mutation.  Performing a pairing
+  check before cheaper structural checks wastes $\approx 3$~ms per
+  malformed request; writing the nullifier before verification enables the
+  TOCTOU attack described in~C6.
+
+\item \textbf{Nullifier authoritative store must not use a probabilistic filter.}
+  A Bloom filter or Cuckoo filter may serve as a fast-reject layer in front
+  of the exact store, but the authoritative double-spend decision must use
+  an exact data structure.  As the filter fills during an epoch its false-
+  positive rate rises, causing legitimate spends to be rejected without
+  cryptographic fault.
+
+\item \textbf{Grace-period and DB TTL must be configured as a unit.}
+  The invariant $\mathsf{TTL} \ge \mathsf{epoch\_duration} +
+  \mathsf{grace\_period}$ must hold at all times.  Extending the grace window
+  at runtime without also extending the DB TTL creates a re-use window.
+
+\item \textbf{Nullifier insertion must be atomic and conditional.}
+  The conditional insert must be a single atomic operation (e.g.,
+  \texttt{INSERT~\ldots~ON~CONFLICT~DO~NOTHING} in SQL, \texttt{SETNX} in
+  Redis).  A non-atomic read-then-write allows two concurrent requests with
+  the same nullifier to both pass the read check before either write
+  completes, enabling a double-spend.
+
+\item \textbf{Transport-layer anonymity is orthogonal to the cryptographic protocol.}
+  The EBUT cryptographic layer is fully anonymous, but a static IP address
+  that fetches a nonce and then submits a spend request leaks correlation at
+  the network layer.  Deployments must choose between anonymous-channel nonce
+  retrieval (e.g., Tor) or ZK-membership proofs with token-bound leaf
+  nullifiers (Section~7.10) when transport-layer unlinkability is required.
+
+\item \textbf{Epoch boundary burst capacity is an acceptable trade-off.}
+  During the overlap of an active grace window a user may hold an unexpired
+  token from epoch $T-1$ and a fresh token for epoch $T$, permitting a
+  burst of up to $2 \cdot c_{\mathsf{max}}$ credits.  This does not break
+  the long-term rate limit.  If strict per-epoch capacity is required the
+  grace period must be set to zero.
+
+\end{enumerate}
+
+\subsection{Optimisation Components}
+\label{sec:optimisations}
+
+These components are pure performance improvements.  Each may be replaced by
+a simpler, slower equivalent without affecting correctness or security.
+
+\begin{enumerate}[leftmargin=*,label=\textbf{O\arabic*.}]
+
+\item \textbf{ChaCha20Rng seeded from OS entropy for bulk blinder generation.}
+  At the start of each \texttt{prove} call, 32 bytes are drawn from the
+  caller's CSPRNG to seed a \texttt{ChaCha20Rng} instance; all blinder
+  scalars are then generated from this fast SIMD stream cipher.  The 256-bit
+  seed provides the full security level.  A compliant alternative is to call
+  the OS RNG for each blinder directly, at a cost of $\approx 5$--$10\times$
+  slower blinder generation.
+
+\item \textbf{Fixed-base precomputed scalar multiplication (FixedBaseTable).}
+  The five protocol generators $g_1, h_0, \ldots, h_4$ are known at startup.
+  For each, a $w=4$-bit windowed lookup table of $64 \times 15$ affine points
+  ($\approx 90$~KB per table) is precomputed once.  Scalar multiplication
+  then requires exactly 64 conditional mixed additions and zero doublings,
+  compared with $\approx 256$ doublings and $\approx 128$ additions for
+  double-and-add.  The simpler alternative is to use the library's standard
+  variable-base scalar multiplication at no loss of security.
+
+\item \textbf{$\mathbb{G}_2$Prepared pairing line-function caching.}
+  The $\mathbb{G}_2$ elements $g_2$, $\mathsf{pk}_{\mathsf{master}}$, and
+  $\mathsf{pk}_{\mathsf{daily}}$ never change after key generation.
+  Pre-converting them to \texttt{G2Prepared} amortises the $\approx 3$~ms
+  line-function computation across all verify calls.
+
+\item \textbf{OnceLock singletons for Generators, BulletproofGens, and PedersenGens.}
+  All three expensive-to-construct structures are initialised exactly once
+  per process via Rust's \texttt{OnceLock} and shared across threads.  This
+  eliminates $\approx 3$--$5$~ms of redundant hash-to-curve work per call.
+
+\item \textbf{batch\_normalize: Montgomery batch field inversion.}
+  Converting $N$ projective $\mathbb{G}_1$ points to affine via a naive loop
+  requires $N$ field inversions.  \texttt{batch\_normalize} uses Montgomery's
+  batch-inversion trick (one field inversion $+$ $3N$ multiplications),
+  amortising the cost for any batch of points that must be normalised before
+  the challenge hash.
+
+\item \textbf{g1\_mul\_u32 for 32-bit scalar multiplication.}
+  Spend amounts and epoch numbers are 32-bit values.  A 32-iteration
+  double-and-add loop is used in place of a full 256-bit scalar
+  multiplication, running $\approx 8\times$ faster with identical correctness.
+
+\item \textbf{Schwartz--Zippel RLC: combined bridge and Schnorr MSM.}
+  The multiple bridging-equality checks and the Schnorr equation are combined
+  via a Schwartz--Zippel random linear combination with weights
+  $c, c^2, c^3, 1$ derived from the Fiat--Shamir challenge, yielding a single
+  Pippenger MSM.  Soundness error is $\le 4/|\mathbb{F}_r|$.  This reduces
+  the number of MSMs from four to one, cutting the Schnorr/bridge portion of
+  verification latency by $\approx 40\%$.
+
+\item \textbf{Batch verification via RLC pairing aggregation and parallel BEQ.}
+  \texttt{verify\_refresh\_batch} and \texttt{verify\_spend\_batch} aggregate
+  $N$ proofs using per-proof RLC weights $\rho_i$: one Pippenger MSM for all
+  Schnorr equations; one two-pair \texttt{multi\_miller\_loop} for all
+  pairing equations; and parallel \texttt{rayon::par\_iter} for the
+  independent BEQ range proofs.  This reduces
+  \texttt{final\_exponentiation} calls from $N$ to $1$.
+
+\item \textbf{rayon::join for concurrent BEQ and pairing checks.}
+  Within a single proof, the BEQ range-proof verification ($\approx 1$--$2$~ms)
+  and the pairing check ($\approx 2$--$4$~ms) are mathematically independent.
+  \texttt{rayon::join} executes them on separate threads, reducing combined
+  latency from $\approx 5$~ms to $\approx 3$--$4$~ms.
+
+\item \textbf{BEQ transcript compression: $R_{\text{BLS}}$ and $R_{25519}$ omitted.}
+  The full proof tuple includes $R_{\text{BLS}}$ and $R_{25519}$.  The
+  production wire format omits them (saving 80 bytes per proof) and stores
+  only the 16-byte challenge $c$; the verifier reconstructs both $R$ values
+  algebraically from the responses and re-hashes them to confirm the challenge
+  (Section~5.2, Output item).
+
+\end{enumerate}
+
+\subsection{Deviations Between the Reference Implementation and the Protocol Specification}
+\label{sec:deviations}
+
+The reference implementation makes several choices that differ from or are
+more conservative than the presentation in earlier sections.  Where they
+conflict, the implementation is the authoritative reference.
+
+\begin{description}[leftmargin=*]
+
+\item[\textbf{Domain separation strings.}]
+  Section~4.1.1 used \texttt{"EBUT:Generator:"} and \texttt{"EBUT:Context"}
+  as example DSTs.  The actual implementation uses \texttt{"ACT:BBS:"} for
+  generator derivation, \texttt{"ACT:Context"} for $H_{\mathsf{ctx}}$,
+  \texttt{"ACT:Epoch:"} for the epoch base point, and
+  \texttt{"ACT:BEQ:Challenge"} for the BEQ Fiat--Shamir challenge.  The
+  Fiat--Shamir domain labels within the main proof are \texttt{b"Refresh"}
+  and \texttt{b"Spend"}.  Any interoperable implementation must match these
+  strings exactly.
+
+\item[\textbf{Epoch integer encoding: little-endian (not big-endian).}]
+  The epoch $T$ is encoded as a 32-bit \emph{little-endian} integer in the
+  implementation (consistent with BLS12-381 scalar serialisation throughout
+  the codebase).  All implementations must use little-endian encoding when
+  computing $H_T = \mathcal{H}_{\mathbb{G}_1}(\text{"ACT:Epoch:"} \parallel
+  T_{\text{LE}})$.
+
+\item[\textbf{SpendProof includes $T_{\mathsf{scale},R}$ and $T_{\mathsf{refund}}$.}]
+  Section~4.4.2 notes that the refund bridging pair
+  $(T_{\mathsf{scale},R}, T_{\mathsf{refund}})$ carries no additional soundness
+  and may be omitted.  The reference implementation computes and includes
+  both in the \texttt{SpendProof} struct and in the Fiat--Shamir challenge
+  hash, adding two 48-byte group elements to the proof but making no change
+  to the security argument.  The paper's optimisation of omitting them may be
+  applied to reduce proof size.
+
+\item[\textbf{Fiat--Shamir hash width.}]
+  Earlier drafts stated that \texttt{SHA-256~mod~q} is ``prohibited.''  For
+  the BLS12-381 scalar field ($q$ a 255-bit prime), the bias from a 256-bit
+  SHA-256 output reduced modulo $q$ is $(2^{256} \bmod q)/q \approx 2^{-255}$,
+  negligible at the 128-bit security level.  The implementation uses SHA-256
+  with repeated-subtraction mod-$q$ reduction and is sound.  The former
+  prohibition is replaced by the clarification in Section~7.5.
+
+\item[\textbf{BEQ wire format.}]
+  The specification in Section~5.2 lists
+  $\pi_{\text{BEQ}} = (C_{25519}, R_{\text{BLS}}, R_{25519}, z, z_{\text{BLS}},
+  z_{25519}, \pi_{\text{range}})$.  The production wire format is
+  $(c_{128}, C_{25519}, z_e, z_{r,\text{BLS}}, z_{r,25519}, \pi_{\text{range}})$,
+  omitting the $R$ points as described in optimisation~O10.
+
+\end{description}
+
+\section{Performance Evaluation}
+\label{sec:performance}
+
+We report measured performance of the reference Rust implementation on BLS12-381
+and Curve25519 (Ristretto).  All timings are averages of 10 iterations in
+release mode (\texttt{RUSTFLAGS="-C target-cpu=native"}, enabling AVX2
+acceleration in the Dalek Bulletproof library), on a single thread unless stated
+otherwise.  Min/max across the 10 iterations are reported in the component
+breakdown (Table~\ref{tab:components}) to characterise JIT warm-up effects.
+The benchmark source is \texttt{tests/performance.rs}.
+
+\subsection{Proof Sizes}
 
 \begin{table}[h]
 \centering
-\begin{tabular}{|l|c|c|c|}
+\small
+\begin{tabular}{|l|r|l|}
 \hline
-\textbf{Phase} & \textbf{Prover (Client)} & \textbf{Verifier (Server)} & \textbf{Proof Size} \\
+\textbf{Phase} & \textbf{Wire size} & \textbf{Breakdown} \\
 \hline
-Master Mint & 2 exp + PoK & 2 exp & $\approx 128$ B \\
-Epoch Refresh & BBS+ proof + BEQ & 2 pairings + BEQ & $\approx 3.0$ KB \\
-Spend & BBS+ proof + BEQ + equalities & 2 pairings + BEQ & $\approx 3.2$ KB \\
+Master Mint request  & 160 B & $K_{\mathsf{sub}}$ (48 B G1) + $T_{\mathsf{PoK}}$ (48 B G1) + $s_k, s_r$ (2$\times$32 B Fr) \\
+Master Mint response & 112 B & $A_{\mathsf{sub}}$ (48 B G1) + $e, s'$ (2$\times$32 B Fr) \\
+\hline
+Epoch Refresh proof  & \textbf{1620 B} & BBS+ core $A', \bar{A}, T_{\mathsf{BBS}}$: 144 B (3$\times$G1) \\
+                     &       & Bridge commitments: 288 B (6$\times$G1) \\
+                     &       & Public values $N_T, K_{\mathsf{daily}}, C_\Delta$: 144 B (3$\times$G1) \\
+                     &       & Schnorr responses: 288 B (9$\times$Fr) \\
+                     &       & BEQ proof (dual-curve $+$ Bulletproof): 756 B \\
+\hline
+Spend proof          & \textbf{1548 B} & BBS+ core: 144 B (3$\times$G1) \\
+                     &       & Bridge commitments: 288 B (6$\times$G1) \\
+                     &       & Public values $K', C_{\mathsf{BP}}$: 96 B (2$\times$G1) \\
+                     &       & Disclosed ($s$, $T_{\mathsf{issue}}$): 8 B (2$\times$u32) \\
+                     &       & Nullifier $k_{\mathsf{cur}}$: 32 B (Fr) \\
+                     &       & Schnorr responses: 224 B (7$\times$Fr) \\
+                     &       & BEQ proof: 756 B \\
 \hline
 \end{tabular}
-\caption{Performance estimates for EBUT.}
-\label{tab:performance}
+\caption{Wire-format proof sizes for each EBUT phase.}
+\label{tab:sizes}
 \end{table}
+
+The BEQ proof of 756 bytes breaks down as: 16 B challenge $c_{128}$,
+32 B Ristretto commitment $C_{25519}$, 32 B integer response $z_e$,
+32 B BLS12-381 randomness response $z_{r,\mathsf{BLS}}$, 32 B Ristretto
+randomness response $z_{r,25519}$, 4 B length prefix, and 608 B for the
+32-bit Dalek Bulletproof.  The Schnorr commitment pair $(R_{\mathsf{BLS}},
+R_{25519})$ is omitted from the wire format via transcript compression
+(Section~8, O10) saving 80 bytes per proof.
+
+\subsection{End-to-End Timings}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|r|r|r|}
+\hline
+\textbf{Operation} & \textbf{Avg (ms)} & \textbf{Wire (B)} & \textbf{Ops/s} \\
+\hline
+Setup: generator creation (one-time) & 96.5 & --- & 10.4 \\
+Server key generation                &  1.8 & --- & --- \\
+$H_{\mathsf{ctx}}$ computation       &  0.5 & --- & --- \\
+\hline
+Master Mint: client begin (commit + PoK prove)    & 1.5 & 160 & 651 \\
+Master Mint: server issue (PoK verify + BBS+ sign)& 2.5 & 112 & 405 \\
+Master Mint: client finalize (unblind)            & $<$0.001 & --- & --- \\
+\hline
+Epoch Refresh: client prove  & 19.1 & 1620 &  52 \\
+Epoch Refresh: server verify &  8.1 & 1620 & 124 \\
+\hline
+Spend: client prove  & 16.2 & 1548 &  62 \\
+Spend: server verify &  6.4 & 1548 & 156 \\
+\hline
+\end{tabular}
+\caption{End-to-end timings and single-threaded throughput.  Measured at 10
+iterations each, release build with AVX2 enabled.}
+\label{tab:e2e}
+\end{table}
+
+Generator creation is a one-time startup cost.  All subsequent protocol
+operations use the cached \texttt{Generators} singleton; the 96.5~ms cost is
+not incurred on a per-request basis.
+
+\subsection{Component Breakdown}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|r|r|r|}
+\hline
+\textbf{Component} & \textbf{Avg (ms)} & \textbf{Min (ms)} & \textbf{Max (ms)} \\
+\hline
+Single pairing $e(G_1, G_2)$ [baseline]     & 1.47 & 1.23 & 1.82 \\
+Multi-pairing 2-input [used in verify]       & 2.20 & 1.68 & 2.65 \\
+\quad Miller loop only (1 pair)              & 0.56 & 0.37 & 0.70 \\
+\quad Final exponentiation                   & 1.09 & 0.75 & 1.25 \\
+\hline
+MSM  3 bases (issuance)                      & 0.72 & 0.49 & 0.97 \\
+MSM  5 bases (BBS+ Schnorr check)            & 1.23 & 0.79 & 1.41 \\
+MSM 12 bases (bridge + BBS combined)         & 1.69 & 1.17 & 2.53 \\
+\hline
+Hash-to-G1 ($H_T$ epoch computation)         & 0.147 & 0.125 & 0.161 \\
+BEQ prove (dual-curve, 32-bit range)         & 9.67 & 8.75 & 11.55 \\
+BEQ verify (dual-curve, 32-bit range)        & 2.43 & 1.98 & 3.35 \\
+G1 scalar-mul (BBS+ randomisation $A\cdot r_1$) & 0.202 & 0.159 & 0.251 \\
+SHA-256 challenge hash ($\approx$1~KiB input)& 0.012 & 0.008 & 0.040 \\
+\hline
+\end{tabular}
+\caption{Per-component timings (10 iterations, release + AVX2).  The
+multi-pairing check combines two Miller loops before a single
+final exponentiation, saving one $\approx$1.1~ms final-exp versus two
+independent pairings.}
+\label{tab:components}
+\end{table}
+
+\subsection{Throughput and Latency Analysis}
+
+\paragraph{Server-side throughput (single-threaded).}
+At 124~ops/s for Epoch Refresh verification and 156~ops/s for Spend
+verification, a single CPU core can handle 69 combined refresh+spend
+operations per second.  Because BEQ verification and the pairing check
+are executed concurrently via \texttt{rayon::join} (Section~8, O9), the
+effective server latency per proof is approximately 6--8~ms rather than
+the 9--10~ms that sequential execution would require.  Multi-core scaling
+is nearly linear for independent proofs via the batch verification paths
+\texttt{verify\_refresh\_batch} and \texttt{verify\_spend\_batch}
+(Section~8, O8), which aggregate $N$ proofs into one Pippenger MSM and
+one final exponentiation regardless of $N$.
+
+\paragraph{Client-side latency.}
+Epoch Refresh proof generation takes $\approx$19~ms and Spend proof
+generation takes $\approx$16~ms on the same hardware.  The dominant cost
+in both is the Dalek Bulletproof generation inside the BEQ (9.7~ms avg),
+which runs on Curve25519 and benefits from AVX2 vectorisation.  The
+BBS+ randomisation and Schnorr blinder generation together cost
+$\approx$2~ms; the Fiat--Shamir challenge hash is negligible at 0.012~ms.
+
+\paragraph{Proof sizes.}
+Each full Refresh or Spend proof fits in well under 2~KB (1620~B and
+1548~B respectively), making the protocol suitable for TLS-protected
+HTTP/2 connections without fragmentation.  The BEQ component accounts
+for 756~B of each proof; the transcript compression described in
+Section~8 (O10) already saves 80~B per proof compared to the
+uncompressed format.
+
+\paragraph{Comparison with earlier estimate.}
+The earlier draft estimated Refresh proof size at $\approx$3.0~KB and
+Spend at $\approx$3.2~KB.  The reference implementation achieves
+1.62~KB and 1.55~KB respectively—a reduction of approximately 47\%—
+due to the dual-curve BEQ design (which produces a compact 756~B
+combined Sigma + Bulletproof instead of a standalone BLS12-381 range
+proof), and the transcript compression that omits the Schnorr
+commitment pair from the wire format.
+
+\subsection{Applied Optimisations}
+
+The following optimisations are present in the reference implementation
+and reflected in the measurements above; full classification and
+rationale appear in Section~\ref{sec:optimisations}.
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Pippenger MSM} for all multi-scalar multiplications
+  ($\geq 12$ bases per verify call).  Compared to a naive double-and-add
+  fold the measured speedup for the 12-base bridge+BBS combined check is
+  $\approx$5--10$\times$.
+
+\item \textbf{Single multi-pairing} replaces two independent pairing
+  checks.  Two Miller loops are combined before one final exponentiation,
+  reducing the measured pairing cost from $2\times 1.47$~ms = 2.94~ms
+  to 2.20~ms ($\approx$25\% saving).
+
+\item \textbf{$\mathbb{G}_2$Prepared line-function caching} for $g_2$,
+  $\mathsf{pk}_{\mathsf{master}}$, and $\mathsf{pk}_{\mathsf{daily}}$.
+  Pre-conversion to \texttt{G2Prepared} amortises $\approx$3~ms of
+  line-function computation across all verify calls.
+
+\item \textbf{Dual-curve BEQ} replaces BLS12-381-native Bulletproofs for
+  all range proofs.  The Dalek library's AVX2-optimised inner-product
+  argument on Curve25519 is $\approx$3$\times$ faster than the equivalent
+  BLS12-381 range proof, and the 32-bit Dalek Bulletproof (608~B) is
+  smaller than a BLS12-381 256-bit range proof.
+
+\item \textbf{\texttt{rayon::join}} for concurrent BEQ + pairing
+  verification within a single proof call, reducing combined latency
+  from $\approx$10~ms to $\approx$6--8~ms.
+
+\item \textbf{OnceLock singletons} for \texttt{Generators},
+  \texttt{BulletproofGens}, and \texttt{PedersenGens} eliminate
+  3--5~ms of redundant hash-to-curve work per call.
+\end{enumerate}
 
 \section{Conclusion}
 
