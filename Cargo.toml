@@ -16,23 +16,25 @@ std = []
 server = ["dep:redis", "dep:tokio", "dep:axum", "dep:bincode", "dep:tower", "dep:tower-http"]
 
 [dependencies]
-# Arkworks ecosystem
-ark-bls12-381 = { version = "0.4.0", default-features = false, features = ["curve"] }
-ark-ec = { version = "0.4.0", default-features = false }
-ark-ff = { version = "0.4.0", default-features = false }
-ark-serialize = { version = "0.4.0", default-features = false }
-ark-std = { version = "0.4.0", default-features = false }
-merlin = { version = "3", default-features = false }
+# blstrs: Rust wrapper for the blst C/ASM BLS12-381 library (industry-standard speed)
+blstrs = "0.7"
+# Pairing-friendly curve abstractions (Engine, MultiMillerLoop)
+pairing = "0.23"
+# Generic group / field traits that blstrs implements
+group = "0.13"
+ff = "0.13"
+
+# Fast CSPRNG: seed once from OsRng, use ChaCha20 stream for all blinders
+rand_chacha = "0.3"
 
 # Dalek Bulletproofs on Curve25519 (for spend-phase range proofs via dual-curve bridge)
 bulletproofs = { version = "4.0.0", default-features = false, features = ["std"] }
 # Must match the exact fork bulletproofs 4.0.0 uses internally
 curve25519-dalek-ng = { version = "4", default-features = false, features = ["alloc", "u64_backend"] }
+merlin = { version = "3", default-features = false }
 
 # Hashing – enable hardware SHA-256 intrinsics where available
 sha2 = { version = "0.10", default-features = false, features = ["asm"] }
-sha3 = { version = "0.10", default-features = false }
-blake2 = { version = "0.10", default-features = false }
 
 # Randomness
 rand = { version = "0.8", default-features = false }

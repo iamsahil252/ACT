@@ -11,7 +11,7 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use ark_std::vec;
+
 #[cfg(feature = "server")]
 use redis::{AsyncCommands, Client};
 #[cfg(feature = "server")]
@@ -241,7 +241,7 @@ impl MerkleTree {
             .leaves
             .iter()
             .copied()
-            .chain(ark_std::iter::repeat([0u8; 16]).take(padded_len - self.leaves.len()))
+            .chain(core::iter::repeat([0u8; 16]).take(padded_len - self.leaves.len()))
             .map(|leaf| {
                 let mut h = [0u8; 32];
                 h.copy_from_slice(Sha256::digest(&leaf).as_slice());
@@ -313,7 +313,7 @@ impl BloomFilter {
 
     fn hash(&self, data: &[u8], seed: u64) -> usize {
         use std::collections::hash_map::DefaultHasher;
-        use ark_std::hash::{Hash, Hasher};
+        use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
         data.hash(&mut hasher);
         seed.hash(&mut hasher);
@@ -496,8 +496,8 @@ pub mod handlers {
     use crate::setup::{Generators, ServerKeys};
     use crate::types::{CompressedG1, Scalar};
     use crate::hash::compute_h_ctx;
-    use ark_ec::CurveGroup;
-    use ark_std::rand::thread_rng;
+    use blstrs::G1Affine;
+    use rand::thread_rng;
     use bincode;
 
     pub struct AppState {
@@ -547,7 +547,7 @@ pub mod handlers {
             &state.keys,
             state.h_ctx,
         )?;
-        Ok((CompressedG1::from_affine(a_sub.into_affine()), e_sub, s_prime))
+        Ok((CompressedG1::from_affine(G1Affine::from(a_sub)), e_sub, s_prime))
     }
 
     pub async fn handle_refresh(
@@ -564,7 +564,7 @@ pub mod handlers {
         }
 
         // 2. Check epoch nullifier (only if not cached)
-        let n_t_compressed = CompressedG1::from_affine(proof.n_t.into_affine());
+        let n_t_compressed = CompressedG1::from_affine(G1Affine::from(proof.n_t));
         if !state.nullifier_mgr.check_epoch_nullifier(&n_t_compressed).await? {
             return Err(ActError::VerificationFailed("Epoch nullifier already used".into()));
         }

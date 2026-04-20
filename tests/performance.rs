@@ -11,11 +11,11 @@
 
 use std::time::{Duration, Instant};
 
-use ark_bls12_381::{Bls12_381, Fq12, G1Projective};
-use ark_ec::{pairing::Pairing, CurveGroup, VariableBaseMSM};
-use ark_ff::Field;
-use ark_std::rand::thread_rng;
-use rand::RngCore;
+use blstrs::{Bls12, G1Affine, G1Projective, G2Affine, G2Prepared, Gt, Scalar as BlsScalar};
+use ff::Field as _;
+use group::Group as _;
+use pairing::{MillerLoopResult as _, MultiMillerLoop as _};
+use rand::thread_rng;
 
 use act::{
     batched_eq::{prove_batched_equality, verify_batched_equality},
@@ -23,6 +23,7 @@ use act::{
     epoch_refresh::{verify_refresh, RefreshProof, RefreshProver},
     hash::hash_to_g1,
     master_mint::{MasterMintClient, MasterMintServer},
+    msm::{batch_normalize, g1_msm},
     setup::{Generators, ServerKeys},
     spend::{verify_spend, SpendProver},
     BbsSignature, Scalar,
@@ -86,23 +87,22 @@ fn spend_proof_size(proof: &act::spend::SpendProof) -> usize {
 // ─── test fixtures ───────────────────────────────────────────────────────────
 
 fn make_daily_sig(
-    rng: &mut impl ark_std::rand::RngCore,
+    rng: &mut impl rand_core::RngCore,
     k_daily: Scalar,
     c_bal: u32,
     t_issue: u32,
     generators: &Generators,
     keys: &ServerKeys,
 ) -> BbsSignature {
-    use ark_bls12_381::Fr;
     let r = Scalar::rand(rng);
-    let k_commit = generators.h[4] * Fr::from(c_bal as u64)
-        + generators.h[1] * k_daily.0
-        + generators.h[2] * Fr::from(t_issue as u64)
-        + generators.h[0] * r.0;
+    let k_commit = &(&generators.h[4] * &BlsScalar::from(c_bal as u64))
+        + &(&(&generators.h[1] * &k_daily.0)
+        + &(&(&generators.h[2] * &BlsScalar::from(t_issue as u64))
+        + &(&generators.h[0] * &r.0)));
     let e = Scalar::rand(rng);
     let s_prime = Scalar::rand(rng);
-    let msg = generators.g1 + k_commit + generators.h[0] * s_prime.0;
-    let a = msg * (e + keys.sk_daily).0.inverse().unwrap();
+    let msg = &(&generators.g1 + &k_commit) + &(&generators.h[0] * &s_prime.0);
+    let a = &msg * &(e + keys.sk_daily).inverse().0;
     BbsSignature { a, e, s: r + s_prime }
 }
 
@@ -269,15 +269,16 @@ fn performance_profile() {
     // ── 5. Component Benchmarks ───────────────────────────────────────────────
     println!("┌─ 5. COMPONENT BENCHMARKS ──────────────────────────────────────────────────┐");
 
-    let g1a = generators.g1.into_affine();
-    let g2a = generators.g2.into_affine();
-    let g1_neg = (-generators.g1).into_affine();
+    let g1a    = G1Affine::from(generators.g1);
+    let g2a    = G2Affine::from(generators.g2);
+    let g1_neg = G1Affine::from(-generators.g1);
+    let g2_prep = G2Prepared::from(g2a);
 
     // 5a. Single pairing (baseline for comparison)
     let mut st = Stats::new();
     for _ in 0..ITERS {
         let t = Instant::now();
-        let _ = Bls12_381::pairing(g1a, g2a);
+        let _ = Bls12::multi_miller_loop(&[(&g1a, &g2_prep)]).final_exponentiation();
         st.record(t.elapsed());
     }
     st.print("Single pairing e(G1, G2)  [baseline]:");
@@ -286,8 +287,8 @@ fn performance_profile() {
     let mut st_mp = Stats::new();
     for _ in 0..ITERS {
         let t = Instant::now();
-        let r = Bls12_381::multi_pairing([g1a, g1_neg], [g2a, g2a]);
-        let _ = r.0 == Fq12::ONE;
+        let r = Bls12::multi_miller_loop(&[(&g1a, &g2_prep), (&g1_neg, &g2_prep)]).final_exponentiation();
+        let _ = r == Gt::identity();
         st_mp.record(t.elapsed());
     }
     st_mp.print("Multi-pairing 2-input  [used in verify]:");
@@ -297,7 +298,7 @@ fn performance_profile() {
         let mut st_single = Stats::new();
         for _ in 0..ITERS {
             let t = Instant::now();
-            let _ = Bls12_381::pairing(g1a, g2a);
+            let _ = Bls12::multi_miller_loop(&[(&g1a, &g2_prep)]).final_exponentiation();
             st_single.record(t.elapsed());
         }
         println!("  →  single: {:.3} ms   multi: {:.3} ms   ratio: {:.2}×",
@@ -310,17 +311,17 @@ fn performance_profile() {
     let mut st = Stats::new();
     for _ in 0..ITERS {
         let t = Instant::now();
-        let _ = Bls12_381::multi_miller_loop([g1a], [g2a]);
+        let _ = Bls12::multi_miller_loop(&[(&g1a, &g2_prep)]);
         st.record(t.elapsed());
     }
     st.print("Miller loop only (1 G1-G2 pair):");
 
     // 5d. Final exponentiation (the other half)
-    let ml = Bls12_381::multi_miller_loop([g1a], [g2a]);
+    let ml = Bls12::multi_miller_loop(&[(&g1a, &g2_prep)]);
     let mut st = Stats::new();
     for _ in 0..ITERS {
         let t = Instant::now();
-        let _ = Bls12_381::final_exponentiation(ml);
+        let _ = ml.final_exponentiation();
         st.record(t.elapsed());
     }
     st.print("Final exponentiation:");
@@ -328,40 +329,40 @@ fn performance_profile() {
 
     // 5e. MSM — 3 bases (token issuance size)
     {
-        let affine = G1Projective::normalize_batch(&[generators.g1, generators.h[0], generators.h[1]]);
+        let affine = batch_normalize(&[generators.g1, generators.h[0], generators.h[1]]);
         let s: Vec<_> = (0..3).map(|_| Scalar::rand(&mut rng).0).collect();
         let mut st = Stats::new();
         for _ in 0..ITERS {
             let t = Instant::now();
-            let _ = G1Projective::msm(&affine, &s).unwrap();
+            let _ = g1_msm(&affine, &s);
             st.record(t.elapsed());
         }
-        st.print("MSM  3 bases  Pippenger  (issuance size):");
+        st.print("MSM  3 bases  (issuance size):");
     }
-    // 5f. MSM — 6 bases (Schnorr check size)
+    // 5f. MSM — 5 bases (Schnorr check size)
     {
-        let affine = G1Projective::normalize_batch(&generators.h[..6.min(generators.h.len())]);
-        let s: Vec<_> = (0..affine.len()).map(|_| Scalar::rand(&mut rng).0).collect();
+        let affine = batch_normalize(&generators.h[..5]);
+        let s: Vec<_> = (0..5).map(|_| Scalar::rand(&mut rng).0).collect();
         let mut st = Stats::new();
         for _ in 0..ITERS {
             let t = Instant::now();
-            let _ = G1Projective::msm(&affine, &s).unwrap();
+            let _ = g1_msm(&affine, &s);
             st.record(t.elapsed());
         }
-        st.print("MSM  5-6 bases Pippenger (BBS+ Schnorr check):");
+        st.print("MSM  5 bases  (BBS+ Schnorr check):");
     }
     // 5g. MSM — 12 bases (bridge check size)
     {
         let pts: Vec<G1Projective> = (0..12).map(|_| generators.g1 * Scalar::rand(&mut rng).0).collect();
-        let affine = G1Projective::normalize_batch(&pts);
+        let affine = batch_normalize(&pts);
         let s: Vec<_> = (0..12).map(|_| Scalar::rand(&mut rng).0).collect();
         let mut st = Stats::new();
         for _ in 0..ITERS {
             let t = Instant::now();
-            let _ = G1Projective::msm(&affine, &s).unwrap();
+            let _ = g1_msm(&affine, &s);
             st.record(t.elapsed());
         }
-        st.print("MSM 12 bases  Pippenger (bridge+BBS combined):");
+        st.print("MSM 12 bases  (bridge+BBS combined):");
     }
     println!();
 

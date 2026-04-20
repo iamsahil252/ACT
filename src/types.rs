@@ -1,27 +1,16 @@
 //! Core types for the ACT protocol.
 //!
-//! This module defines `Scalar` (an element of the BLS12‑381 scalar field) and
-//! compressed representations for G1 and G2 points. All serialization follows
-//! the canonical, fixed‑length formats required by the specification:
-//! - Scalars: 32‑byte little‑endian, with values ≥ group order rejected.
-//! - G1 points: 48‑byte compressed.
-//! - G2 points: 96‑byte compressed.
-//!
-//! Subgroup validation is enforced on all deserialized group elements.
+//! This module defines `Scalar` (an element of the BLS12-381 scalar field) and
+//! compressed representations for G1 and G2 points, all backed by the blstrs
+//! assembly-optimised library.
 
-use ark_std::io::{Read, Write};
-
-use ark_bls12_381::{Fr, G1Affine, G2Affine, G1Projective, G2Projective};
-use ark_ff::{Field, PrimeField};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, SerializationError, Validate, Valid};
-use ark_std::rand::{
-    distributions::{Distribution, Standard},
-    Rng, RngCore,
-};
-use ark_std::{UniformRand, Zero};
+use blstrs::{G1Affine, G1Projective, G2Affine, G2Projective, Scalar as BlsScalar};
+use ff::Field;
+use group::Group;
+use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use core::fmt;
-use core::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
+use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 use crate::error::{ActError, Result};
 
@@ -29,27 +18,27 @@ use crate::error::{ActError, Result};
 // Scalar
 // ============================================================================
 
-/// A scalar field element (modulo the BLS12‑381 group order).
+/// A scalar field element (modulo the BLS12-381 group order).
 ///
-/// # Serialization
-/// Scalars are always serialized as 32‑byte little‑endian. Deserialization
-/// rejects any value ≥ the group order.
+/// Thin wrapper around `blstrs::Scalar` that provides by-value arithmetic and
+/// the serialization interface expected by the rest of the ACT protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct Scalar(pub Fr);
+pub struct Scalar(pub BlsScalar);
 
 impl Scalar {
     /// The zero scalar.
-    pub const ZERO: Self = Self(Fr::ZERO);
+    pub const ZERO: Self = Self(BlsScalar::ZERO);
 
     /// The scalar `1`.
-    pub const ONE: Self = Self(Fr::ONE);
+    pub const ONE: Self = Self(BlsScalar::ONE);
 
     /// Generate a random scalar using the given RNG.
+    #[inline]
     pub fn rand(rng: &mut impl RngCore) -> Self {
-        Self(Fr::rand(rng))
+        Self(BlsScalar::random(rng))
     }
 
-    /// Generate a random non‑zero scalar.
+    /// Generate a random non-zero scalar.
     pub fn rand_nonzero(rng: &mut impl RngCore) -> Self {
         loop {
             let s = Self::rand(rng);
@@ -60,38 +49,34 @@ impl Scalar {
     }
 
     /// Returns `true` if the scalar equals zero.
+    #[inline]
     pub fn is_zero(&self) -> bool {
-        self.0.is_zero()
+        bool::from(self.0.is_zero())
     }
 
-    /// Convert to a 32‑byte little‑endian array.
+    /// Convert to a 32-byte little-endian array (canonical form).
+    #[inline]
     pub fn to_bytes(&self) -> [u8; 32] {
-        let mut bytes = [0u8; 32];
-        self.0
-            .serialize_compressed(&mut bytes[..])
-            .expect("32 bytes sufficient");
-        bytes
+        self.0.to_bytes_le()
     }
 
-    /// Create from a 32‑byte little‑endian array.
+    /// Create from a 32-byte little-endian array.
     ///
     /// # Errors
     /// Returns `ActError::InvalidScalar` if the bytes represent a value ≥ the
     /// group order.
     pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self> {
-        Fr::deserialize_compressed(&bytes[..])
+        Option::<BlsScalar>::from(BlsScalar::from_bytes_le(bytes))
             .map(Scalar)
-            .map_err(|_| ActError::InvalidScalar)
+            .ok_or(ActError::InvalidScalar)
     }
 
-    /// Create from a 32‑byte array without canonical check (for trusted inputs).
-    ///
-    /// # Safety
-    /// Only use when the bytes are known to represent a valid field element.
+    /// Create from bytes without canonical check (for trusted inputs).
     pub(crate) fn from_bytes_unchecked(bytes: &[u8; 32]) -> Self {
-        Fr::deserialize_uncompressed_unchecked(&bytes[..])
+        // Try canonical first; if it fails use mod reduction.
+        Option::<BlsScalar>::from(BlsScalar::from_bytes_le(bytes))
             .map(Scalar)
-            .unwrap_or_else(|_| Scalar(Fr::from_le_bytes_mod_order(bytes)))
+            .unwrap_or_else(|| Self(crate::hash::scalar_from_le_bytes_mod_order(bytes)))
     }
 
     /// Compute the multiplicative inverse.
@@ -99,153 +84,95 @@ impl Scalar {
     /// # Panics
     /// Panics if the scalar is zero.
     pub fn inverse(&self) -> Self {
-        Self(self.0.inverse().expect("cannot invert zero"))
+        Self(self.0.invert().expect("cannot invert zero"))
     }
 
-    /// Exponentiate a group element by this scalar.
-    pub fn mul_g1(&self, p: G1Projective) -> G1Projective {
-        p * self.0
+    /// Multiply a G1 projective point by this scalar.
+    #[inline]
+    pub fn mul_g1(self, p: G1Projective) -> G1Projective {
+        &p * &self.0
     }
 }
 
-// ---- Arithmetic ------------------------------------------------------------
+// ---- Arithmetic (by-value, wrapping blstrs references internally) ----------
+
+impl Neg for Scalar {
+    type Output = Self;
+    fn neg(self) -> Self { Self(-self.0) }
+}
 
 impl Add for Scalar {
     type Output = Self;
-    fn add(self, rhs: Self) -> Self {
-        Self(self.0 + rhs.0)
-    }
+    fn add(self, rhs: Self) -> Self { Self(&self.0 + &rhs.0) }
 }
 
 impl AddAssign for Scalar {
-    fn add_assign(&mut self, rhs: Self) {
-        self.0 += rhs.0;
-    }
+    fn add_assign(&mut self, rhs: Self) { self.0 += &rhs.0; }
 }
 
 impl Sub for Scalar {
     type Output = Self;
-    fn sub(self, rhs: Self) -> Self {
-        Self(self.0 - rhs.0)
-    }
+    fn sub(self, rhs: Self) -> Self { Self(&self.0 - &rhs.0) }
 }
 
 impl SubAssign for Scalar {
-    fn sub_assign(&mut self, rhs: Self) {
-        self.0 -= rhs.0;
-    }
+    fn sub_assign(&mut self, rhs: Self) { self.0 -= &rhs.0; }
 }
 
 impl Mul for Scalar {
     type Output = Self;
-    fn mul(self, rhs: Self) -> Self {
-        Self(self.0 * rhs.0)
-    }
+    fn mul(self, rhs: Self) -> Self { Self(&self.0 * &rhs.0) }
 }
 
 impl MulAssign for Scalar {
-    fn mul_assign(&mut self, rhs: Self) {
-        self.0 *= rhs.0;
-    }
+    fn mul_assign(&mut self, rhs: Self) { self.0 *= &rhs.0; }
 }
 
-// Multiplication by u32/u64 (for convenience)
 impl Mul<u32> for Scalar {
     type Output = Self;
-    fn mul(self, rhs: u32) -> Self {
-        Self(self.0 * Fr::from(rhs as u64))
-    }
+    fn mul(self, rhs: u32) -> Self { Self(&self.0 * &BlsScalar::from(rhs as u64)) }
 }
 
 impl Mul<u64> for Scalar {
     type Output = Self;
-    fn mul(self, rhs: u64) -> Self {
-        Self(self.0 * Fr::from(rhs))
-    }
+    fn mul(self, rhs: u64) -> Self { Self(&self.0 * &BlsScalar::from(rhs)) }
 }
 
 impl Mul<Scalar> for u32 {
     type Output = Scalar;
-    fn mul(self, rhs: Scalar) -> Scalar {
-        rhs * self
-    }
+    fn mul(self, rhs: Scalar) -> Scalar { rhs * self }
 }
 
 impl Mul<Scalar> for u64 {
     type Output = Scalar;
-    fn mul(self, rhs: Scalar) -> Scalar {
-        rhs * self
-    }
+    fn mul(self, rhs: Scalar) -> Scalar { rhs * self }
 }
 
 // ---- From conversions -------------------------------------------------------
 
 impl From<u64> for Scalar {
-    fn from(x: u64) -> Self {
-        Self(Fr::from(x))
-    }
+    fn from(x: u64) -> Self { Self(BlsScalar::from(x)) }
 }
 
 impl From<u32> for Scalar {
-    fn from(x: u32) -> Self {
-        Self(Fr::from(x as u64))
-    }
+    fn from(x: u32) -> Self { Self(BlsScalar::from(x as u64)) }
 }
 
 impl From<usize> for Scalar {
-    fn from(x: usize) -> Self {
-        Self(Fr::from(x as u64))
-    }
+    fn from(x: usize) -> Self { Self(BlsScalar::from(x as u64)) }
 }
 
-// ---- Distribution for random sampling ---------------------------------------
-
-impl Distribution<Scalar> for Standard {
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Scalar {
-        Scalar(Fr::rand(rng))
-    }
-}
-
-// ---- Canonical serialization ------------------------------------------------
-impl CanonicalSerialize for Scalar {
-    fn serialize_with_mode<W: Write>(
-        &self,
-        mut writer: W,
-        _compress: Compress,
-    ) -> core::result::Result<(), SerializationError> {
-        self.0.serialize_with_mode(&mut writer, Compress::Yes)
-    }
-    fn serialized_size(&self, _compress: Compress) -> usize { 32 }
-}
-
-impl Valid for Scalar {
-    fn check(&self) -> core::result::Result<(), SerializationError> {
-        Ok(())
-    }
-}
-
-impl CanonicalDeserialize for Scalar {
-    fn deserialize_with_mode<R: Read>(
-        mut reader: R,
-        compress: Compress,
-        validate: Validate,
-    ) -> core::result::Result<Self, SerializationError> {
-        let fr = Fr::deserialize_with_mode(&mut reader, compress, validate)?;
-        Ok(Scalar(fr))
-    }
-}
-
-// ---- Serde serialization for Scalar ----------------------------------------
+// ---- Serde for Scalar -------------------------------------------------------
 
 impl Serialize for Scalar {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
-        self.to_bytes().serialize(serializer)
+    fn serialize<S: serde::Serializer>(&self, s: S) -> core::result::Result<S::Ok, S::Error> {
+        self.to_bytes().serialize(s)
     }
 }
 
 impl<'de> Deserialize<'de> for Scalar {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
-        let bytes = <[u8; 32]>::deserialize(deserializer)?;
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> core::result::Result<Self, D::Error> {
+        let bytes = <[u8; 32]>::deserialize(d)?;
         Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
     }
 }
@@ -254,52 +181,42 @@ impl<'de> Deserialize<'de> for Scalar {
 // G1Projective serde module
 // ============================================================================
 
-/// Serde module for serializing/deserializing `G1Projective` as a compressed
-/// 48-byte array. Use with `#[serde(with = "crate::types::g1_serde")]`.
+/// Serde module for `G1Projective` (compressed 48-byte array).
+/// Use with `#[serde(with = "crate::types::g1_serde")]`.
 pub mod g1_serde {
-    use ark_bls12_381::{G1Affine, G1Projective};
-    use ark_ec::CurveGroup;
-    use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+    use blstrs::{G1Affine, G1Projective};
+    use group::Group;
     use serde::{Deserializer, Serializer, de::SeqAccess};
 
-    pub fn serialize<S: Serializer>(p: &G1Projective, serializer: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(p: &G1Projective, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeTuple;
-        let mut bytes = [0u8; 48];
-        p.into_affine()
-            .serialize_compressed(&mut bytes[..])
-            .map_err(serde::ser::Error::custom)?;
-        let mut tup = serializer.serialize_tuple(48)?;
+        let bytes = G1Affine::from(p).to_compressed();
+        let mut tup = s.serialize_tuple(48)?;
         for b in &bytes {
             tup.serialize_element(b)?;
         }
         tup.end()
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<G1Projective, D::Error> {
-        struct Bytes48Visitor;
-
-        impl<'de> serde::de::Visitor<'de> for Bytes48Visitor {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<G1Projective, D::Error> {
+        struct V48;
+        impl<'de> serde::de::Visitor<'de> for V48 {
             type Value = [u8; 48];
-
             fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
                 f.write_str("48-byte compressed G1 point")
             }
-
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<[u8; 48], A::Error> {
                 let mut bytes = [0u8; 48];
                 for b in bytes.iter_mut() {
-                    *b = seq
-                        .next_element()?
-                        .ok_or_else(|| serde::de::Error::custom("too few bytes for G1 point"))?;
+                    *b = seq.next_element()?.ok_or_else(|| serde::de::Error::custom("too few bytes"))?;
                 }
                 Ok(bytes)
             }
         }
-
-        let bytes = deserializer.deserialize_tuple(48, Bytes48Visitor)?;
-        let affine = G1Affine::deserialize_compressed(&bytes[..])
-            .map_err(serde::de::Error::custom)?;
-        Ok(affine.into())
+        let bytes = d.deserialize_tuple(48, V48)?;
+        Option::<G1Affine>::from(G1Affine::from_compressed(&bytes))
+            .map(G1Projective::from)
+            .ok_or_else(|| serde::de::Error::custom("invalid compressed G1"))
     }
 }
 
@@ -308,41 +225,26 @@ pub mod g1_serde {
 // ============================================================================
 
 /// Compressed G1 point (48 bytes).
-///
-/// Implements strict subgroup validation on deserialization.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CompressedG1(pub [u8; 48]);
 
 impl CompressedG1 {
-    /// Create from an affine point.
+    pub fn from_projective(p: G1Projective) -> Self {
+        Self(G1Affine::from(p).to_compressed())
+    }
+
     pub fn from_affine(p: G1Affine) -> Self {
-        let mut bytes = [0u8; 48];
-        p.serialize_compressed(&mut bytes[..]).unwrap();
-        Self(bytes)
+        Self(p.to_compressed())
     }
 
-    /// Convert to affine, performing subgroup check.
-    ///
-    /// # Errors
-    /// Returns `ActError::InvalidSubgroup` if the point is not in the correct
-    /// prime‑order subgroup.
+    /// Convert to affine, enforcing subgroup membership.
     pub fn to_affine(&self) -> Result<G1Affine> {
-        let affine = G1Affine::deserialize_compressed(&self.0[..])?;
-        if !affine.is_in_correct_subgroup_assuming_on_curve() {
-            return Err(ActError::InvalidSubgroup);
-        }
-        Ok(affine)
+        Option::<G1Affine>::from(G1Affine::from_compressed(&self.0))
+            .ok_or(ActError::InvalidSubgroup)
     }
 
-    /// Convert to projective without subgroup validation (use with caution).
-    pub(crate) fn to_projective_unchecked(&self) -> Result<G1Projective> {
-        let affine = G1Affine::deserialize_compressed(&self.0[..])?;
-        Ok(affine.into())
-    }
-
-    /// Convert to projective, performing subgroup check.
     pub fn to_projective(&self) -> Result<G1Projective> {
-        self.to_affine().map(Into::into)
+        self.to_affine().map(G1Projective::from)
     }
 }
 
@@ -357,22 +259,21 @@ impl fmt::Debug for CompressedG1 {
 pub struct CompressedG2(pub [u8; 96]);
 
 impl CompressedG2 {
+    pub fn from_projective(p: G2Projective) -> Self {
+        Self(G2Affine::from(p).to_compressed())
+    }
+
     pub fn from_affine(p: G2Affine) -> Self {
-        let mut bytes = [0u8; 96];
-        p.serialize_compressed(&mut bytes[..]).unwrap();
-        Self(bytes)
+        Self(p.to_compressed())
     }
 
     pub fn to_affine(&self) -> Result<G2Affine> {
-        let affine = G2Affine::deserialize_compressed(&self.0[..])?;
-        if !affine.is_in_correct_subgroup_assuming_on_curve() {
-            return Err(ActError::InvalidSubgroup);
-        }
-        Ok(affine)
+        Option::<G2Affine>::from(G2Affine::from_compressed(&self.0))
+            .ok_or(ActError::InvalidSubgroup)
     }
 
     pub fn to_projective(&self) -> Result<G2Projective> {
-        self.to_affine().map(Into::into)
+        self.to_affine().map(G2Projective::from)
     }
 }
 
@@ -383,61 +284,44 @@ impl fmt::Debug for CompressedG2 {
 }
 
 // ============================================================================
-// Serde Wrappers for JSON Serialization
+// Hex JSON wrappers
 // ============================================================================
 
-/// Hex‑encoded scalar for JSON serialization.
-///
-/// Always uses 64 hex characters (32 bytes) with lowercase letters.
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HexScalar(#[serde(with = "hex::serde")] [u8; 32]);
 
 impl From<Scalar> for HexScalar {
-    fn from(s: Scalar) -> Self {
-        Self(s.to_bytes())
-    }
+    fn from(s: Scalar) -> Self { Self(s.to_bytes()) }
 }
-
 impl TryFrom<HexScalar> for Scalar {
     type Error = ActError;
-    fn try_from(h: HexScalar) -> Result<Self> {
-        Scalar::from_bytes(&h.0)
-    }
+    fn try_from(h: HexScalar) -> Result<Self> { Scalar::from_bytes(&h.0) }
 }
 
-/// Hex‑encoded compressed G1 point for JSON serialization.
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HexG1(#[serde(with = "hex::serde")] [u8; 48]);
 
 impl From<CompressedG1> for HexG1 {
-    fn from(c: CompressedG1) -> Self {
-        Self(c.0)
-    }
+    fn from(c: CompressedG1) -> Self { Self(c.0) }
 }
-
 impl TryFrom<HexG1> for CompressedG1 {
     type Error = ActError;
     fn try_from(h: HexG1) -> Result<Self> {
-        // Deserialize and validate subgroup
         let c = CompressedG1(h.0);
         let _ = c.to_affine()?;
         Ok(c)
     }
 }
 
-/// Hex‑encoded compressed G2 point for JSON serialization.
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HexG2(#[serde(with = "hex::serde")] [u8; 96]);
 
 impl From<CompressedG2> for HexG2 {
-    fn from(c: CompressedG2) -> Self {
-        Self(c.0)
-    }
+    fn from(c: CompressedG2) -> Self { Self(c.0) }
 }
-
 impl TryFrom<HexG2> for CompressedG2 {
     type Error = ActError;
     fn try_from(h: HexG2) -> Result<Self> {
@@ -454,36 +338,45 @@ impl TryFrom<HexG2> for CompressedG2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_ec::{CurveGroup, Group};
-    use ark_std::rand::thread_rng;
+    use rand::thread_rng;
 
     #[test]
-    fn scalar_serialization_roundtrip() {
+    fn scalar_roundtrip() {
         let mut rng = thread_rng();
         let s = Scalar::rand(&mut rng);
-        let bytes = s.to_bytes();
-        let s2 = Scalar::from_bytes(&bytes).unwrap();
+        let b = s.to_bytes();
+        let s2 = Scalar::from_bytes(&b).unwrap();
         assert_eq!(s, s2);
     }
 
     #[test]
-    fn scalar_canonical_rejection() {
-        // Construct bytes representing the modulus
-        let mut bytes = [0xFFu8; 32];
-        // Modulus is slightly smaller than 2^256, so all FFs is definitely >= modulus
-        let result = Scalar::from_bytes(&bytes);
-        assert!(matches!(result, Err(ActError::InvalidScalar)));
+    fn scalar_rejects_out_of_range() {
+        let bytes = [0xFFu8; 32];
+        assert!(matches!(Scalar::from_bytes(&bytes), Err(ActError::InvalidScalar)));
     }
 
     #[test]
-    fn g1_subgroup_check() {
-        let g1 = G1Projective::generator();
-        let comp = CompressedG1::from_affine(g1.into_affine());
-        assert!(comp.to_affine().is_ok());
+    fn g1_roundtrip() {
+        let p = G1Projective::generator();
+        let c = CompressedG1::from_projective(p);
+        let p2 = c.to_projective().unwrap();
+        assert_eq!(p, p2);
+    }
 
-        // Small subgroup point: multiply by cofactor (3 for BLS12‑381) to get a point
-        // not in the prime‑order subgroup. We'll construct an invalid point by
-        // clearing the compression bits? Actually easier: take a random point and
-        // verify it passes.
+    #[test]
+    fn g2_roundtrip() {
+        let p = G2Projective::generator();
+        let c = CompressedG2::from_projective(p);
+        let p2 = c.to_projective().unwrap();
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn scalar_arithmetic() {
+        let a = Scalar::from(3u64);
+        let b = Scalar::from(4u64);
+        assert_eq!(a + b, Scalar::from(7u64));
+        assert_eq!(a * b, Scalar::from(12u64));
+        assert_eq!(b - a, Scalar::ONE);
     }
 }
