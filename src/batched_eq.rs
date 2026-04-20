@@ -184,7 +184,7 @@ fn rand_dalek_scalar(rng: &mut (impl CryptoRng + RngCore)) -> DalekScalar {
 
 fn compute_beq_challenge(
     context: &[u8],
-    commitments: &[G1Affine],
+    comm_bytes: &[[u8; 48]],
     c_bls_bytes: &[u8; 48],
     c_25519_bytes: &[u8; 32],
     r_bls_bytes: &[u8; 48],
@@ -194,8 +194,8 @@ fn compute_beq_challenge(
     let mut hasher = Sha256::new();
     hasher.update(b"ACT:BEQ:Challenge");
     hasher.update(context);
-    for comm in commitments {
-        hasher.update(comm.to_compressed());
+    for cb in comm_bytes {
+        hasher.update(cb);
     }
     hasher.update(c_bls_bytes);
     hasher.update(c_25519_bytes);
@@ -244,6 +244,10 @@ pub fn prove_batched_equality(
     let pc_gens = dalek_pc_gens();
     let bp_gens = dalek_bp_gens();
 
+    // Pre-serialize BBS+/bridge commitments once; reused in both the Sigma
+    // challenge and the Bulletproof transcript (avoids double to_compressed()).
+    let comm_bytes: Vec<[u8; 48]> = commitments.iter().map(|c| c.to_compressed()).collect();
+
     let m_dalek = DalekScalar::from(m as u64);
     let c_25519_point = pc_gens.commit(m_dalek, r_25519);
     let c_25519_bytes: [u8; 32] = c_25519_point.compress().to_bytes();
@@ -252,8 +256,8 @@ pub fn prove_batched_equality(
     range_transcript.append_message(b"ctx", context);
     // Bind the BBS+ and bridge commitments directly to the Bulletproof
     // transcript to prevent splicing attacks (Section 9.2).
-    for comm in commitments {
-        range_transcript.append_message(b"comm", comm.to_compressed().as_ref());
+    for cb in &comm_bytes {
+        range_transcript.append_message(b"comm", cb.as_ref());
     }
     let (dalek_proof, _committed) = DalekRangeProof::prove_single(
         bp_gens, pc_gens, &mut range_transcript, m as u64, &r_25519, 32,
@@ -287,7 +291,7 @@ pub fn prove_batched_equality(
 
     // ── Step 6: 128-bit Fiat–Shamir challenge ────────────────────────────────
     let c128 = compute_beq_challenge(
-        context, commitments, &c_bls_bytes, &c_25519_bytes, &r_bls_bytes, &r_25519_bytes, &range_proof_bytes,
+        context, &comm_bytes, &c_bls_bytes, &c_25519_bytes, &r_bls_bytes, &r_25519_bytes, &range_proof_bytes,
     );
     let c_32 = c128_to_bytes32(&c128);
     let c_limbs = u256_from_le_bytes(&c_32);
@@ -365,6 +369,10 @@ pub fn verify_batched_equality(
         ActError::VerificationFailed("BatchedEqualityProof: invalid C_25519 point".into())
     })?;
 
+    // Pre-serialize BBS+/bridge commitments once; reused in both the Sigma
+    // challenge and the Bulletproof transcript (avoids double to_compressed()).
+    let comm_bytes: Vec<[u8; 48]> = commitments.iter().map(|c| c.to_compressed()).collect();
+
     // ── 5. Reconstruct R points ───────────────────────────────────────────────
     // R_BLS  = z_m·h4 + z_r·h0 − c·C_BLS
     let r_bls_point = &(&(&h4 * &z_m_bls) + &(&h0 * &z_r_bls)) - &(&c_bls * &c_fr);
@@ -379,7 +387,7 @@ pub fn verify_batched_equality(
     let c_bls_bytes = G1Affine::from(c_bls).to_compressed();
     let expected_c128 = compute_beq_challenge(
         context,
-        commitments,
+        &comm_bytes,
         &c_bls_bytes,
         &proof.c_25519_bytes,
         &r_bls_recon_bytes,
@@ -400,8 +408,8 @@ pub fn verify_batched_equality(
     let mut range_transcript = Transcript::new(b"ACT:BEQ:Range");
     range_transcript.append_message(b"ctx", context);
     // Re-bind the BBS+ and bridge commitments to match the prover's transcript.
-    for comm in commitments {
-        range_transcript.append_message(b"comm", comm.to_compressed().as_ref());
+    for cb in &comm_bytes {
+        range_transcript.append_message(b"comm", cb.as_ref());
     }
     dalek_proof.verify_single(&bp_gens, &pc_gens, &mut range_transcript, &c_25519_compressed, 32)
         .map_err(|e| {

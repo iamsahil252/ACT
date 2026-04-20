@@ -12,7 +12,10 @@ categories = ["cryptography", "web-programming::http-client"]
 
 [features]
 default = ["std"]
-std = []
+std = ["dep:rayon"]
+# Enable AVX2-vectorised Ristretto arithmetic in curve25519-dalek-ng.
+# Requires a nightly Rust toolchain (the upstream crate uses packed_simd_2).
+simd_backend = ["curve25519-dalek-ng/simd_backend"]
 server = ["dep:redis", "dep:tokio", "dep:axum", "dep:bincode", "dep:tower", "dep:tower-http"]
 
 [dependencies]
@@ -32,6 +35,9 @@ bulletproofs = { version = "4.0.0", default-features = false, features = ["std"]
 # Must match the exact fork bulletproofs 4.0.0 uses internally
 curve25519-dalek-ng = { version = "4", default-features = false, features = ["alloc", "u64_backend"] }
 merlin = { version = "3", default-features = false }
+
+# Parallel verification tail (rayon::join for Bulletproof + pairing checks)
+rayon = { version = "1.10", optional = true }
 
 # Hashing – enable hardware SHA-256 intrinsics where available
 sha2 = { version = "0.10", default-features = false, features = ["asm"] }
