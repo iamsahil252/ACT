@@ -28,9 +28,12 @@ ff = "0.13"
 rand_chacha = "0.3"
 
 # Dalek Bulletproofs on Curve25519 (for spend-phase range proofs via dual-curve bridge)
-bulletproofs = { version = "4.0.0", default-features = false, features = ["std"] }
-# Must match the exact fork bulletproofs 4.0.0 uses internally
-curve25519-dalek-ng = { version = "4", default-features = false, features = ["alloc", "u64_backend"] }
+# v5 moves back to the official curve25519-dalek v4 crate whose SIMD backend
+# compiles on stable Rust (uses std::arch instead of nightly packed_simd).
+bulletproofs = { version = "5.0.0", default-features = false, features = ["std"] }
+# Official curve25519-dalek v4 (required by bulletproofs 5).  AVX2 SIMD is
+# activated automatically when built with RUSTFLAGS="-C target-cpu=native".
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc"] }
 merlin = { version = "3", default-features = false }
 
 # Parallel verification tail (rayon::join for Bulletproof + pairing checks)

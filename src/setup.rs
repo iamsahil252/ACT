@@ -6,13 +6,14 @@ use rand_core::RngCore;
 use std::sync::OnceLock;
 
 use crate::hash::hash_to_g1;
-use crate::msm::batch_normalize;
+use crate::msm::{batch_normalize, FixedBaseTable};
 use crate::types::Scalar;
 
 /// BBS+ generators: `g1 ∈ G1`, `g2 ∈ G2`, and `h_0 … h_4 ∈ G1`.
 ///
-/// All affine forms and G2Prepared pairing tables are precomputed exactly once
-/// per process and shared via a `OnceLock` singleton.
+/// All affine forms, G2Prepared pairing tables, and fixed-base scalar
+/// multiplication tables are precomputed exactly once per process and shared
+/// via a `OnceLock` singleton.
 #[derive(Clone, Debug)]
 pub struct Generators {
     pub g1: G1Projective,
@@ -24,6 +25,10 @@ pub struct Generators {
     pub h_affine: [G1Affine; 5],
     /// Precomputed G2Prepared pairing line functions for `g2`.
     pub g2_prepared: G2Prepared,
+    /// Precomputed fixed-base scalar-multiplication table for `g1`.
+    pub g1_table: FixedBaseTable,
+    /// Precomputed fixed-base scalar-multiplication tables for `h[0..5]`.
+    pub h_tables: [FixedBaseTable; 5],
 }
 
 static GENERATORS: OnceLock<Generators> = OnceLock::new();
@@ -58,7 +63,19 @@ impl Generators {
         let g1_affine = G1Affine::from(g1);
         let g2_prepared = G2Prepared::from(G2Affine::from(g2));
 
-        Self { g1, g2, h, g1_affine, h_affine, g2_prepared }
+        // Precompute fixed-base scalar-multiplication tables for all five
+        // protocol generators.  Each table holds 64 windows × 15 non-zero
+        // affine entries ≈ 90 KB; computed once at startup via the singleton.
+        let g1_table = FixedBaseTable::new(&g1_affine);
+        let h_tables = [
+            FixedBaseTable::new(&h_affine[0]),
+            FixedBaseTable::new(&h_affine[1]),
+            FixedBaseTable::new(&h_affine[2]),
+            FixedBaseTable::new(&h_affine[3]),
+            FixedBaseTable::new(&h_affine[4]),
+        ];
+
+        Self { g1, g2, h, g1_affine, h_affine, g2_prepared, g1_table, h_tables }
     }
 }
 
