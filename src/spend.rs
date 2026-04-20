@@ -175,14 +175,20 @@ impl SpendProver {
         beq_ctx.extend_from_slice(&k_cur.to_bytes());
         beq_ctx.extend_from_slice(&t_issue.to_le_bytes());
         beq_ctx.extend_from_slice(nonce);
-        beq_ctx.extend_from_slice(&G1Affine::from(k_prime).to_compressed());
-        beq_ctx.extend_from_slice(&G1Affine::from(c_total).to_compressed());
-        beq_ctx.extend_from_slice(&G1Affine::from(a_prime).to_compressed());
-        beq_ctx.extend_from_slice(&G1Affine::from(a_bar).to_compressed());
-        beq_ctx.extend_from_slice(&G1Affine::from(t_bbs).to_compressed());
+
+        // BBS+ and bridge commitments passed explicitly into the BatchedEqualityProof
+        // so they are bound in both the Sigma challenge and the Bulletproof transcript
+        // (prevents transcript-splicing attacks per Section 9.2 of the ACT paper).
+        let beq_commitments = [
+            G1Affine::from(a_prime),
+            G1Affine::from(a_bar),
+            G1Affine::from(t_bbs),
+            G1Affine::from(k_prime),
+            G1Affine::from(c_total),
+        ];
 
         let (batched_eq, c_bp_from_beq) = prove_batched_equality(
-            &mut fast_rng, m, r_bp.0, generators.h[4], generators.h[0], &beq_ctx,
+            &mut fast_rng, m, r_bp.0, generators.h[4], generators.h[0], &beq_ctx, &beq_commitments,
         )?;
         debug_assert_eq!(c_bp, c_bp_from_beq, "c_bp mismatch");
         let beq_bytes = batched_eq.to_bytes();
@@ -364,12 +370,14 @@ pub fn verify_spend(
     beq_ctx.extend_from_slice(&proof.k_cur.to_bytes());
     beq_ctx.extend_from_slice(&proof.t_issue.to_le_bytes());
     beq_ctx.extend_from_slice(nonce);
-    beq_ctx.extend_from_slice(&G1Affine::from(proof.k_prime).to_compressed());
-    beq_ctx.extend_from_slice(&G1Affine::from(c_total).to_compressed());
-    beq_ctx.extend_from_slice(&G1Affine::from(proof.a_prime).to_compressed());
-    beq_ctx.extend_from_slice(&G1Affine::from(proof.a_bar).to_compressed());
-    beq_ctx.extend_from_slice(&G1Affine::from(proof.t_bbs).to_compressed());
-    verify_batched_equality(&proof.batched_eq, proof.c_bp, generators.h[4], generators.h[0], &beq_ctx)?;
+    let beq_commitments = [
+        G1Affine::from(proof.a_prime),
+        G1Affine::from(proof.a_bar),
+        G1Affine::from(proof.t_bbs),
+        G1Affine::from(proof.k_prime),
+        G1Affine::from(c_total),
+    ];
+    verify_batched_equality(&proof.batched_eq, proof.c_bp, generators.h[4], generators.h[0], &beq_ctx, &beq_commitments)?;
 
     // Pairing check: e(A', pk_daily) * e(-A_bar, g2) == GT::identity()
     let pairing_result = Bls12::multi_miller_loop(&[

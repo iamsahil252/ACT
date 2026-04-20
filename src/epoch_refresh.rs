@@ -180,14 +180,18 @@ impl RefreshProver {
         let mut beq_ctx = Vec::new();
         beq_ctx.extend_from_slice(&h_ctx.to_bytes());
         beq_ctx.extend_from_slice(&t.to_le_bytes());
-        beq_ctx.extend_from_slice(&G1Affine::from(n_t).to_compressed());
-        beq_ctx.extend_from_slice(&G1Affine::from(k_daily_commit).to_compressed());
-        beq_ctx.extend_from_slice(&G1Affine::from(a_prime).to_compressed());
-        beq_ctx.extend_from_slice(&G1Affine::from(a_bar).to_compressed());
-        beq_ctx.extend_from_slice(&G1Affine::from(t_bbs).to_compressed());
+
+        // BBS+ and bridge commitments passed explicitly to prevent splicing attacks.
+        let beq_commitments = [
+            G1Affine::from(a_prime),
+            G1Affine::from(a_bar),
+            G1Affine::from(t_bbs),
+            G1Affine::from(n_t),
+            G1Affine::from(k_daily_commit),
+        ];
 
         let (batched_eq, c_delta_from_beq) = prove_batched_equality(
-            &mut fast_rng, delta, r_delta.0, generators.h[3], generators.h[0], &beq_ctx,
+            &mut fast_rng, delta, r_delta.0, generators.h[3], generators.h[0], &beq_ctx, &beq_commitments,
         )?;
         debug_assert_eq!(c_delta, c_delta_from_beq, "c_delta mismatch");
         let beq_bytes = batched_eq.to_bytes();
@@ -368,12 +372,14 @@ pub fn verify_refresh(
     let mut beq_ctx = Vec::new();
     beq_ctx.extend_from_slice(&h_ctx.to_bytes());
     beq_ctx.extend_from_slice(&current_epoch.to_le_bytes());
-    beq_ctx.extend_from_slice(&G1Affine::from(proof.n_t).to_compressed());
-    beq_ctx.extend_from_slice(&G1Affine::from(proof.k_daily).to_compressed());
-    beq_ctx.extend_from_slice(&G1Affine::from(proof.a_prime).to_compressed());
-    beq_ctx.extend_from_slice(&G1Affine::from(proof.a_bar).to_compressed());
-    beq_ctx.extend_from_slice(&G1Affine::from(proof.t_bbs).to_compressed());
-    verify_batched_equality(&proof.batched_eq, proof.c_delta, generators.h[3], generators.h[0], &beq_ctx)?;
+    let beq_commitments = [
+        G1Affine::from(proof.a_prime),
+        G1Affine::from(proof.a_bar),
+        G1Affine::from(proof.t_bbs),
+        G1Affine::from(proof.n_t),
+        G1Affine::from(proof.k_daily),
+    ];
+    verify_batched_equality(&proof.batched_eq, proof.c_delta, generators.h[3], generators.h[0], &beq_ctx, &beq_commitments)?;
 
     // Pairing check: e(A', pk_master) * e(-A_bar, g2) == GT::identity()
     let pairing_result = Bls12::multi_miller_loop(&[

@@ -1,15 +1,20 @@
 //! Multi-scalar multiplication (MSM) helpers for G1 over blstrs.
 //!
-//! Uses blstrs's native `G1Projective * &Scalar` which internally calls the
-//! highly-optimised blst assembly.  For the proof sizes used in ACT (≤ 32
-//! bases) the per-multiplication cost is dominated by the blst scalar mult; a
-//! Pippenger bucket reduction would add complexity without significant gain at
-//! this scale.
+//! `g1_msm` delegates to `G1Projective::multi_exp`, which is blstrs's built-in
+//! Pippenger MSM backed by the highly-optimised blst C/ASM library.
+//!
+//! `batch_normalize` uses `group::Curve::batch_normalize`, which performs a
+//! Montgomery batch-inversion to convert N projective points to affine with a
+//! single field inversion and 3N multiplications instead of N inversions.
 
 use blstrs::{G1Affine, G1Projective, Scalar};
-use group::Group;
+use group::{Curve, Group};
 
-/// Compute `∑ bases[i] * scalars[i]` over G1.
+/// Compute `∑ bases[i] * scalars[i]` over G1 using Pippenger MSM.
+///
+/// Delegates to `G1Projective::multi_exp`, which calls blst's highly-optimised
+/// Pippenger algorithm.  This is significantly faster than a naive scalar-mul
+/// loop for all batch sizes ≥ 2.
 ///
 /// Returns the identity element if `bases` is empty.
 ///
@@ -17,22 +22,29 @@ use group::Group;
 /// Panics if `bases.len() != scalars.len()`.
 pub fn g1_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     assert_eq!(bases.len(), scalars.len(), "MSM: bases/scalars length mismatch");
-    bases
-        .iter()
-        .zip(scalars.iter())
-        .map(|(b, s)| {
-            let p = G1Projective::from(b);
-            &p * s
-        })
-        .fold(G1Projective::identity(), |acc, p| &acc + &p)
+    if bases.is_empty() {
+        return G1Projective::identity();
+    }
+    // Convert affine → projective (cheap: just sets Z = 1).
+    // G1Projective::multi_exp then runs Pippenger internally.
+    let proj: Vec<G1Projective> = bases.iter().map(G1Projective::from).collect();
+    G1Projective::multi_exp(&proj, scalars)
 }
 
 /// Batch-normalise a slice of projective G1 points into their affine forms.
 ///
-/// Each conversion uses a single field inversion internally.  For 10–20 points
-/// the practical cost difference to a batch inversion is negligible.
+/// Uses `group::Curve::batch_normalize`, which applies Montgomery's batch-
+/// inversion trick: one field inversion + 3N multiplications, compared with N
+/// independent field inversions for a naive sequential conversion.  Calling
+/// this in a loop doing N individual `G1Affine::from` conversions requires N
+/// inversions, which is significantly more expensive for N > 1.
 pub fn batch_normalize(points: &[G1Projective]) -> Vec<G1Affine> {
-    points.iter().map(G1Affine::from).collect()
+    if points.is_empty() {
+        return Vec::new();
+    }
+    let mut affines = vec![G1Affine::default(); points.len()];
+    G1Projective::batch_normalize(points, &mut affines);
+    affines
 }
 
 /// Multiply a G1 point by a 32-bit unsigned scalar using a 32-iteration

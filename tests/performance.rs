@@ -382,17 +382,17 @@ fn performance_profile() {
     let mut st_bpp = Stats::new();
     for _ in 0..ITERS {
         let t = Instant::now();
-        let _ = prove_batched_equality(&mut rng, beq_val, beq_blind.0, generators.h[4], generators.h[0], beq_ctx).unwrap();
+        let _ = prove_batched_equality(&mut rng, beq_val, beq_blind.0, generators.h[4], generators.h[0], beq_ctx, &[]).unwrap();
         st_bpp.record(t.elapsed());
     }
     st_bpp.print("BatchedEqualityProof prove  (dual-curve, 32-bit):");
 
     // 5j. BatchedEqualityProof verify (dual-curve, 32-bit range)
-    let (beq_proof, beq_commit) = prove_batched_equality(&mut rng, beq_val, beq_blind.0, generators.h[4], generators.h[0], beq_ctx).unwrap();
+    let (beq_proof, beq_commit) = prove_batched_equality(&mut rng, beq_val, beq_blind.0, generators.h[4], generators.h[0], beq_ctx, &[]).unwrap();
     let mut st_bpv = Stats::new();
     for _ in 0..ITERS {
         let t = Instant::now();
-        verify_batched_equality(&beq_proof, beq_commit, generators.h[4], generators.h[0], beq_ctx).unwrap();
+        verify_batched_equality(&beq_proof, beq_commit, generators.h[4], generators.h[0], beq_ctx, &[]).unwrap();
         st_bpv.record(t.elapsed());
     }
     st_bpv.print("BatchedEqualityProof verify (dual-curve, 32-bit):");
