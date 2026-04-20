@@ -44,9 +44,9 @@ pub use commitments::{commit, verify_bridge, verify_bridge_single_base};
 #[cfg(feature = "std")]
 pub use master_mint::{MasterMintClient, MasterMintRequest, MasterMintServer, ProofOfKnowledge};
 #[cfg(feature = "std")]
-pub use epoch_refresh::{RefreshProof, RefreshProver, RefreshResponse, verify_refresh};
+pub use epoch_refresh::{RefreshProof, RefreshProver, RefreshResponse, verify_refresh, verify_refresh_batch};
 #[cfg(feature = "std")]
-pub use spend::{SpendProof, SpendProver, SpendResponse, verify_spend};
+pub use spend::{SpendProof, SpendProver, SpendResponse, verify_spend, verify_spend_batch};
 
 /// The current version of the ACT protocol implementation.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -14,7 +14,12 @@ use group::{Curve, Group};
 ///
 /// Delegates to `G1Projective::multi_exp`, which calls blst's highly-optimised
 /// Pippenger algorithm.  This is significantly faster than a naive scalar-mul
-/// loop for all batch sizes ≥ 2.
+/// loop for all batch sizes ≥ 12.
+///
+/// For small batches (< 12 points) the Pippenger algorithm's bucket-setup
+/// overhead dominates; a plain fold using `&G1Projective + &G1Affine` mixed
+/// addition is used instead, avoiding both the heap allocation of a temporary
+/// projective vector and the algorithm's fixed setup cost.
 ///
 /// Returns the identity element if `bases` is empty.
 ///
@@ -25,8 +30,16 @@ pub fn g1_msm(bases: &[G1Affine], scalars: &[Scalar]) -> G1Projective {
     if bases.is_empty() {
         return G1Projective::identity();
     }
-    // Convert affine → projective (cheap: just sets Z = 1).
-    // G1Projective::multi_exp then runs Pippenger internally.
+    // For small batches the Pippenger set-up cost dominates.  A plain fold
+    // using the blstrs mixed-addition operator (&G1Projective + &G1Affine) is
+    // faster and requires no temporary heap allocation.
+    if bases.len() < 12 {
+        return bases.iter().zip(scalars.iter()).fold(
+            G1Projective::identity(),
+            |acc, (base, scalar)| &acc + &(base * scalar),
+        );
+    }
+    // For larger batches use Pippenger MSM.
     let proj: Vec<G1Projective> = bases.iter().map(G1Projective::from).collect();
     G1Projective::multi_exp(&proj, scalars)
 }
