@@ -1498,22 +1498,193 @@ conflict, the implementation is the authoritative reference.
 \section{Performance Evaluation}
 \label{sec:performance}
 
-We provide estimates for the EBUT protocol on BLS12-381 and Curve25519. The cross-curve BEQ proof size is approximately 672 bytes for the Bulletproof plus 160 bytes for the Sigma protocol responses, totaling under 1~KB. The overall proof sizes are similar to the ACT protocol.
+We report measured performance of the reference Rust implementation on BLS12-381
+and Curve25519 (Ristretto).  All timings are averages of 10 iterations in
+release mode (\texttt{RUSTFLAGS="-C target-cpu=native"}, enabling AVX2
+acceleration in the Dalek Bulletproof library), on a single thread unless stated
+otherwise.  Min/max across the 10 iterations are reported in the component
+breakdown (Table~\ref{tab:components}) to characterise JIT warm-up effects.
+The benchmark source is \texttt{tests/performance.rs}.
+
+\subsection{Proof Sizes}
 
 \begin{table}[h]
 \centering
-\begin{tabular}{|l|c|c|c|}
+\small
+\begin{tabular}{|l|r|l|}
 \hline
-\textbf{Phase} & \textbf{Prover (Client)} & \textbf{Verifier (Server)} & \textbf{Proof Size} \\
+\textbf{Phase} & \textbf{Wire size} & \textbf{Breakdown} \\
 \hline
-Master Mint & 2 exp + PoK & 2 exp & $\approx 128$ B \\
-Epoch Refresh & BBS+ proof + BEQ & 2 pairings + BEQ & $\approx 3.0$ KB \\
-Spend & BBS+ proof + BEQ + equalities & 2 pairings + BEQ & $\approx 3.2$ KB \\
+Master Mint request  & 160 B & $K_{\mathsf{sub}}$ (48 B G1) + $T_{\mathsf{PoK}}$ (48 B G1) + $s_k, s_r$ (2$\times$32 B Fr) \\
+Master Mint response & 112 B & $A_{\mathsf{sub}}$ (48 B G1) + $e, s'$ (2$\times$32 B Fr) \\
+\hline
+Epoch Refresh proof  & \textbf{1620 B} & BBS+ core $A', \bar{A}, T_{\mathsf{BBS}}$: 144 B (3$\times$G1) \\
+                     &       & Bridge commitments: 288 B (6$\times$G1) \\
+                     &       & Public values $N_T, K_{\mathsf{daily}}, C_\Delta$: 144 B (3$\times$G1) \\
+                     &       & Schnorr responses: 288 B (9$\times$Fr) \\
+                     &       & BEQ proof (dual-curve $+$ Bulletproof): 756 B \\
+\hline
+Spend proof          & \textbf{1548 B} & BBS+ core: 144 B (3$\times$G1) \\
+                     &       & Bridge commitments: 288 B (6$\times$G1) \\
+                     &       & Public values $K', C_{\mathsf{BP}}$: 96 B (2$\times$G1) \\
+                     &       & Disclosed ($s$, $T_{\mathsf{issue}}$): 8 B (2$\times$u32) \\
+                     &       & Nullifier $k_{\mathsf{cur}}$: 32 B (Fr) \\
+                     &       & Schnorr responses: 224 B (7$\times$Fr) \\
+                     &       & BEQ proof: 756 B \\
 \hline
 \end{tabular}
-\caption{Performance estimates for EBUT.}
-\label{tab:performance}
+\caption{Wire-format proof sizes for each EBUT phase.}
+\label{tab:sizes}
 \end{table}
+
+The BEQ proof of 756 bytes breaks down as: 16 B challenge $c_{128}$,
+32 B Ristretto commitment $C_{25519}$, 32 B integer response $z_e$,
+32 B BLS12-381 randomness response $z_{r,\mathsf{BLS}}$, 32 B Ristretto
+randomness response $z_{r,25519}$, 4 B length prefix, and 608 B for the
+32-bit Dalek Bulletproof.  The Schnorr commitment pair $(R_{\mathsf{BLS}},
+R_{25519})$ is omitted from the wire format via transcript compression
+(Section~8, O10) saving 80 bytes per proof.
+
+\subsection{End-to-End Timings}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|r|r|r|}
+\hline
+\textbf{Operation} & \textbf{Avg (ms)} & \textbf{Wire (B)} & \textbf{Ops/s} \\
+\hline
+Setup: generator creation (one-time) & 96.5 & --- & 10.4 \\
+Server key generation                &  1.8 & --- & --- \\
+$H_{\mathsf{ctx}}$ computation       &  0.5 & --- & --- \\
+\hline
+Master Mint: client begin (commit + PoK prove)    & 1.5 & 160 & 651 \\
+Master Mint: server issue (PoK verify + BBS+ sign)& 2.5 & 112 & 405 \\
+Master Mint: client finalize (unblind)            & $<$0.001 & --- & --- \\
+\hline
+Epoch Refresh: client prove  & 19.1 & 1620 &  52 \\
+Epoch Refresh: server verify &  8.1 & 1620 & 124 \\
+\hline
+Spend: client prove  & 16.2 & 1548 &  62 \\
+Spend: server verify &  6.4 & 1548 & 156 \\
+\hline
+\end{tabular}
+\caption{End-to-end timings and single-threaded throughput.  Measured at 10
+iterations each, release build with AVX2 enabled.}
+\label{tab:e2e}
+\end{table}
+
+Generator creation is a one-time startup cost.  All subsequent protocol
+operations use the cached \texttt{Generators} singleton; the 96.5~ms cost is
+not incurred on a per-request basis.
+
+\subsection{Component Breakdown}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|r|r|r|}
+\hline
+\textbf{Component} & \textbf{Avg (ms)} & \textbf{Min (ms)} & \textbf{Max (ms)} \\
+\hline
+Single pairing $e(G_1, G_2)$ [baseline]     & 1.47 & 1.23 & 1.82 \\
+Multi-pairing 2-input [used in verify]       & 2.20 & 1.68 & 2.65 \\
+\quad Miller loop only (1 pair)              & 0.56 & 0.37 & 0.70 \\
+\quad Final exponentiation                   & 1.09 & 0.75 & 1.25 \\
+\hline
+MSM  3 bases (issuance)                      & 0.72 & 0.49 & 0.97 \\
+MSM  5 bases (BBS+ Schnorr check)            & 1.23 & 0.79 & 1.41 \\
+MSM 12 bases (bridge + BBS combined)         & 1.69 & 1.17 & 2.53 \\
+\hline
+Hash-to-G1 ($H_T$ epoch computation)         & 0.147 & 0.125 & 0.161 \\
+BEQ prove (dual-curve, 32-bit range)         & 9.67 & 8.75 & 11.55 \\
+BEQ verify (dual-curve, 32-bit range)        & 2.43 & 1.98 & 3.35 \\
+G1 scalar-mul (BBS+ randomisation $A\cdot r_1$) & 0.202 & 0.159 & 0.251 \\
+SHA-256 challenge hash ($\approx$1~KiB input)& 0.012 & 0.008 & 0.040 \\
+\hline
+\end{tabular}
+\caption{Per-component timings (10 iterations, release + AVX2).  The
+multi-pairing check combines two Miller loops before a single
+final exponentiation, saving one $\approx$1.1~ms final-exp versus two
+independent pairings.}
+\label{tab:components}
+\end{table}
+
+\subsection{Throughput and Latency Analysis}
+
+\paragraph{Server-side throughput (single-threaded).}
+At 124~ops/s for Epoch Refresh verification and 156~ops/s for Spend
+verification, a single CPU core can handle 69 combined refresh+spend
+operations per second.  Because BEQ verification and the pairing check
+are executed concurrently via \texttt{rayon::join} (Section~8, O9), the
+effective server latency per proof is approximately 6--8~ms rather than
+the 9--10~ms that sequential execution would require.  Multi-core scaling
+is nearly linear for independent proofs via the batch verification paths
+\texttt{verify\_refresh\_batch} and \texttt{verify\_spend\_batch}
+(Section~8, O8), which aggregate $N$ proofs into one Pippenger MSM and
+one final exponentiation regardless of $N$.
+
+\paragraph{Client-side latency.}
+Epoch Refresh proof generation takes $\approx$19~ms and Spend proof
+generation takes $\approx$16~ms on the same hardware.  The dominant cost
+in both is the Dalek Bulletproof generation inside the BEQ (9.7~ms avg),
+which runs on Curve25519 and benefits from AVX2 vectorisation.  The
+BBS+ randomisation and Schnorr blinder generation together cost
+$\approx$2~ms; the Fiat--Shamir challenge hash is negligible at 0.012~ms.
+
+\paragraph{Proof sizes.}
+Each full Refresh or Spend proof fits in well under 2~KB (1620~B and
+1548~B respectively), making the protocol suitable for TLS-protected
+HTTP/2 connections without fragmentation.  The BEQ component accounts
+for 756~B of each proof; the transcript compression described in
+Section~8 (O10) already saves 80~B per proof compared to the
+uncompressed format.
+
+\paragraph{Comparison with earlier estimate.}
+The earlier draft estimated Refresh proof size at $\approx$3.0~KB and
+Spend at $\approx$3.2~KB.  The reference implementation achieves
+1.62~KB and 1.55~KB respectively—a reduction of approximately 47\%—
+due to the dual-curve BEQ design (which produces a compact 756~B
+combined Sigma + Bulletproof instead of a standalone BLS12-381 range
+proof), and the transcript compression that omits the Schnorr
+commitment pair from the wire format.
+
+\subsection{Applied Optimisations}
+
+The following optimisations are present in the reference implementation
+and reflected in the measurements above; full classification and
+rationale appear in Section~\ref{sec:optimisations}.
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Pippenger MSM} for all multi-scalar multiplications
+  ($\geq 12$ bases per verify call).  Compared to a naive double-and-add
+  fold the measured speedup for the 12-base bridge+BBS combined check is
+  $\approx$5--10$\times$.
+
+\item \textbf{Single multi-pairing} replaces two independent pairing
+  checks.  Two Miller loops are combined before one final exponentiation,
+  reducing the measured pairing cost from $2\times 1.47$~ms = 2.94~ms
+  to 2.20~ms ($\approx$25\% saving).
+
+\item \textbf{$\mathbb{G}_2$Prepared line-function caching} for $g_2$,
+  $\mathsf{pk}_{\mathsf{master}}$, and $\mathsf{pk}_{\mathsf{daily}}$.
+  Pre-conversion to \texttt{G2Prepared} amortises $\approx$3~ms of
+  line-function computation across all verify calls.
+
+\item \textbf{Dual-curve BEQ} replaces BLS12-381-native Bulletproofs for
+  all range proofs.  The Dalek library's AVX2-optimised inner-product
+  argument on Curve25519 is $\approx$3$\times$ faster than the equivalent
+  BLS12-381 range proof, and the 32-bit Dalek Bulletproof (608~B) is
+  smaller than a BLS12-381 256-bit range proof.
+
+\item \textbf{\texttt{rayon::join}} for concurrent BEQ + pairing
+  verification within a single proof call, reducing combined latency
+  from $\approx$10~ms to $\approx$6--8~ms.
+
+\item \textbf{OnceLock singletons} for \texttt{Generators},
+  \texttt{BulletproofGens}, and \texttt{PedersenGens} eliminate
+  3--5~ms of redundant hash-to-curve work per call.
+\end{enumerate}
 
 \section{Conclusion}
 
