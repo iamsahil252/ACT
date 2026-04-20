@@ -344,22 +344,20 @@ pub fn verify_spend(
             proof.t_bp, proof.t_scale_bp, proof.t_bbs,
         ]);
 
-        let bases = [
-            generators.h_affine[0], generators.h_affine[1],
-            generators.h_affine[2], generators.h_affine[4],
-            generators.g1_affine,
-            dyn_pts[0], dyn_pts[1],  dyn_pts[2],  dyn_pts[3], dyn_pts[4],
-            dyn_pts[5], dyn_pts[6],  dyn_pts[7],  dyn_pts[8],
-            dyn_pts[9], dyn_pts[10], dyn_pts[11],
-        ];
-        let scalars = [
-            sc_h0, sc_h1, sc_h2, sc_h4, sc_g1,
+        // Fixed-base part: use precomputed tables for the 5 protocol generators.
+        let mut fixed_sum = generators.h_tables[0].mul(&sc_h0);
+        fixed_sum = &fixed_sum + &generators.h_tables[1].mul(&sc_h1);
+        fixed_sum = &fixed_sum + &generators.h_tables[2].mul(&sc_h2);
+        fixed_sum = &fixed_sum + &generators.h_tables[4].mul(&sc_h4);
+        fixed_sum = &fixed_sum + &generators.g1_table.mul(&sc_g1);
+
+        // Variable-base part: 12 dynamic proof points via Pippenger MSM.
+        let var_scalars = [
             sc_aprime, sc_ctotal, sc_kprime, sc_cbp, sc_abar,
             sc_ttotal, sc_tscale_t, sc_trefund, sc_tscale_r,
             sc_tbp, sc_tscale_bp, sc_tbbs,
         ];
-
-        let combined = g1_msm(&bases, &scalars);
+        let combined = &fixed_sum + &g1_msm(&dyn_pts, &var_scalars);
         if !bool::from(combined.is_identity()) {
             return Err(ActError::VerificationFailed("Combined bridge+Schnorr check failed".into()));
         }
@@ -587,18 +585,15 @@ pub fn verify_spend_batch(
         }
     }
 
-    let mut msm_bases:   Vec<G1Affine>  = Vec::with_capacity(5 + dyn_bases.len());
-    let mut msm_scalars: Vec<BlsScalar> = Vec::with_capacity(5 + dyn_scalars.len());
-    msm_bases.extend_from_slice(&[
-        generators.h_affine[0], generators.h_affine[1],
-        generators.h_affine[2], generators.h_affine[4],
-        generators.g1_affine,
-    ]);
-    msm_scalars.extend_from_slice(&[acc_h0, acc_h1, acc_h2, acc_h4, acc_g1]);
-    msm_bases.extend_from_slice(&dyn_bases);
-    msm_scalars.extend_from_slice(&dyn_scalars);
+    // Fixed-base part: use precomputed tables for the 5 accumulated scalars.
+    let mut fixed_sum = generators.h_tables[0].mul(&acc_h0);
+    fixed_sum = &fixed_sum + &generators.h_tables[1].mul(&acc_h1);
+    fixed_sum = &fixed_sum + &generators.h_tables[2].mul(&acc_h2);
+    fixed_sum = &fixed_sum + &generators.h_tables[4].mul(&acc_h4);
+    fixed_sum = &fixed_sum + &generators.g1_table.mul(&acc_g1);
 
-    let combined = g1_msm(&msm_bases, &msm_scalars);
+    // Variable-base part: N×12 dynamic points via Pippenger MSM.
+    let combined = &fixed_sum + &g1_msm(&dyn_bases, &dyn_scalars);
     if !bool::from(combined.is_identity()) {
         return Err(ActError::VerificationFailed("Batched Schnorr check failed".into()));
     }

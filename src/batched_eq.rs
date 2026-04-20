@@ -30,8 +30,8 @@ use sha2::{Digest, Sha256};
 use std::io::Write as _;
 
 use bulletproofs::{BulletproofGens, PedersenGens, RangeProof as DalekRangeProof};
-use curve25519_dalek_ng::ristretto::{CompressedRistretto, RistrettoPoint};
-use curve25519_dalek_ng::scalar::Scalar as DalekScalar;
+use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
+use curve25519_dalek::scalar::Scalar as DalekScalar;
 use merlin::Transcript;
 use std::sync::OnceLock;
 
