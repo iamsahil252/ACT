@@ -1,37 +1,99 @@
-//! Domain‑separated hashing utilities.
-//!
-//! This module provides:
-//! - `compute_h_ctx`: the application context hash binding the protocol to a
-//!   specific deployment.
-//! - `hash_to_g1`: deterministic hash to the G1 group (RFC 9380).
-//! - `hash_to_scalar`: Fiat–Shamir challenge generation.
-//!
-//! All hash functions use strong domain separation tags as required by the
-//! specification.
+//! Domain-separated hashing utilities backed by blstrs and SHA-256.
 
 extern crate alloc;
-use ark_bls12_381::{G1Projective, G2Projective};
-use ark_ec::hashing::{
-    curve_maps::wb::WBMap,
-    map_to_curve_hasher::MapToCurveBasedHasher,
-    HashToCurve,
-};
-use ark_ff::field_hashers::DefaultFieldHasher;
-use ark_serialize::CanonicalSerialize;
+use blstrs::{G1Affine, G1Projective, G2Affine, G2Projective, Scalar as BlsScalar};
+use group::Group;
 use sha2::{Digest, Sha256};
+use std::io::Write as _;
+
 use crate::setup::Generators;
 use crate::types::Scalar;
 
+// ============================================================================
+// BLS12-381 scalar field modulus in little-endian u64 limbs
+// r = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001
+// ============================================================================
+const R_LIMBS: [u64; 4] = [
+    0xffffffff00000001,
+    0x53bda402fffe5bfe,
+    0x3339d80809a1d805,
+    0x73eda753299d7d48,
+];
+
+/// Reduce an arbitrary 32-byte little-endian integer modulo the scalar field order.
+///
+/// For a 256-bit input, at most two subtractions of `r` are needed before the
+/// value is canonical.  This is called from `scalar_from_hash` and from the
+/// `Scalar::from_bytes_unchecked` path.
+pub(crate) fn scalar_from_le_bytes_mod_order(bytes: &[u8; 32]) -> BlsScalar {
+    let mut v = le_bytes_to_u64x4(bytes);
+
+    // Subtract r until v < r (at most 2 iterations for 256-bit inputs).
+    for _ in 0..3 {
+        if lt_r(&v) {
+            let canonical = u64x4_to_le_bytes(&v);
+            return Option::<BlsScalar>::from(BlsScalar::from_bytes_le(&canonical))
+                .expect("v < r guaranteed by lt_r check");
+        }
+        v = sub_u64x4(v, R_LIMBS);
+    }
+    // After 3 subtractions the value must be < r for any 256-bit input.
+    let canonical = u64x4_to_le_bytes(&v);
+    Option::<BlsScalar>::from(BlsScalar::from_bytes_le(&canonical))
+        .expect("mod reduction failed – value still not canonical")
+}
+
+// ---- 256-bit integer helpers ------------------------------------------------
+
+#[inline]
+fn le_bytes_to_u64x4(bytes: &[u8; 32]) -> [u64; 4] {
+    let mut limbs = [0u64; 4];
+    for i in 0..4 {
+        limbs[i] = u64::from_le_bytes(bytes[i * 8..(i + 1) * 8].try_into().unwrap());
+    }
+    limbs
+}
+
+#[inline]
+fn u64x4_to_le_bytes(limbs: &[u64; 4]) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    for i in 0..4 {
+        bytes[i * 8..(i + 1) * 8].copy_from_slice(&limbs[i].to_le_bytes());
+    }
+    bytes
+}
+
+#[inline]
+fn lt_r(v: &[u64; 4]) -> bool {
+    for i in (0..4).rev() {
+        if v[i] != R_LIMBS[i] {
+            return v[i] < R_LIMBS[i];
+        }
+    }
+    false // equal to r → not strictly less
+}
+
+#[inline]
+fn sub_u64x4(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
+    let mut result = [0u64; 4];
+    let mut borrow = 0u64;
+    for i in 0..4 {
+        let (d1, ov1) = a[i].overflowing_sub(b[i]);
+        let (d2, ov2) = d1.overflowing_sub(borrow);
+        result[i] = d2;
+        borrow = u64::from(ov1 | ov2);
+    }
+    result
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
 /// Compute the application context hash `H_ctx`.
 ///
-/// This value binds all Fiat–Shamir challenges to the specific application and
-/// its public keys, preventing cross‑deployment replay attacks.
-///
-/// # Arguments
-/// - `app_id`: a unique identifier for the service (e.g., "https://api.example.com/v1").
-/// - `pk_master`: the server's master token public key.
-/// - `pk_daily`: the server's daily token public key.
-/// - `generators`: the global BBS+ generators.
+/// Binds all Fiat–Shamir challenges to a specific deployment and set of public
+/// keys, preventing cross-deployment replay attacks.
 pub fn compute_h_ctx(
     app_id: &str,
     pk_master: &G2Projective,
@@ -41,91 +103,102 @@ pub fn compute_h_ctx(
     let mut hasher = Sha256::new();
     hasher.update(b"ACT:Context");
     hasher.update(app_id.as_bytes());
-
-    // Serialize all points directly into the hasher (no intermediate Vec).
     {
         let mut w = HasherWriter(&mut hasher);
-        pk_master.serialize_compressed(&mut w).unwrap();
-        pk_daily.serialize_compressed(&mut w).unwrap();
-        generators.g1.serialize_compressed(&mut w).unwrap();
-        generators.g2.serialize_compressed(&mut w).unwrap();
+        write_g2(&mut w, *pk_master);
+        write_g2(&mut w, *pk_daily);
+        write_g1(&mut w, generators.g1);
+        write_g2(&mut w, generators.g2);
         for h in &generators.h {
-            h.serialize_compressed(&mut w).unwrap();
+            write_g1(&mut w, *h);
         }
     }
-
-    scalar_from_hash(hasher.finalize())
+    let d = hasher.finalize();
+    let bytes: [u8; 32] = { let s: &[u8] = &d[..]; s.try_into().unwrap() };
+    scalar_from_hash(&bytes)
 }
 
-/// Hash a message to a point in G1 using the BLS12‑381 hash‑to‑curve suite.
+/// Hash a message to a point in G1 using the BLS12-381 hash-to-curve suite.
 ///
-/// Implements RFC 9380 `hash_to_curve` via the Wahby‑Boneh (WB) method with
-/// `expand_message_xmd` using SHA‑256, matching the BLS12‑381 G1 ciphersuite
-/// `BLS12381G1_XMD:SHA-256_SSWU_RO_` but with a caller‑supplied DST for
-/// protocol‑layer domain separation.
-///
-/// The domain separation tag (DST) should be a string like `"ACT:Epoch:"`.
+/// Implements RFC 9380 `hash_to_curve` via the blst C library (WB-SSWU method
+/// with `expand_message_xmd` using SHA-256).  The DST provides protocol-level
+/// domain separation.
 pub fn hash_to_g1(dst: &[u8], message: &[u8]) -> G1Projective {
-    type G1Hasher = MapToCurveBasedHasher<
-        G1Projective,
-        DefaultFieldHasher<Sha256>,
-        WBMap<ark_bls12_381::g1::Config>,
-    >;
-    let hasher =
-        <G1Hasher as HashToCurve<G1Projective>>::new(dst).expect("hash_to_g1 domain setup");
-    hasher.hash(message).expect("hash_to_g1 mapping").into()
+    G1Projective::hash_to_curve(message, dst, b"")
 }
 
-/// Hash an arbitrary preimage to a scalar for Fiat–Shamir challenges.
-///
-/// The output is uniformly distributed in the scalar field.
+/// Hash an arbitrary preimage to a scalar (Fiat–Shamir helper).
 pub fn hash_to_scalar(preimage: &[u8]) -> Scalar {
-    let digest = Sha256::digest(preimage);
-    scalar_from_hash(digest)
+    let digest: [u8; 32] = {
+        let d = Sha256::digest(preimage);
+        let s: &[u8] = &d[..];
+        s.try_into().unwrap()
+    };
+    scalar_from_hash(&digest)
 }
 
-/// An adapter that implements [`ark_std::io::Write`] by forwarding bytes into a
+/// An adapter that implements `std::io::Write` by forwarding bytes into a
 /// running `sha2::Sha256` hasher.
 ///
-/// This lets `CanonicalSerialize::serialize_compressed` feed bytes directly
-/// into the hasher without any intermediate heap allocation.
+/// Lets serialization routines feed bytes directly into the hasher without any
+/// intermediate heap allocation.
 pub(crate) struct HasherWriter<'a>(pub &'a mut Sha256);
 
-impl ark_std::io::Write for HasherWriter<'_> {
+impl std::io::Write for HasherWriter<'_> {
     #[inline(always)]
-    fn write(&mut self, buf: &[u8]) -> ark_std::io::Result<usize> {
-        Digest::update(self.0, buf);
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
         Ok(buf.len())
     }
     #[inline(always)]
-    fn flush(&mut self) -> ark_std::io::Result<()> {
-        Ok(())
-    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
-/// Finalise a running `sha2::Sha256` hasher and return a Fiat–Shamir scalar.
-///
-/// Use together with [`HasherWriter`] to build challenge preimages without any
-/// intermediate `Vec<u8>` allocation.
+/// Finalise a running `Sha256` hasher and return a Fiat–Shamir scalar.
 pub(crate) fn hash_to_scalar_from_hasher(hasher: Sha256) -> Scalar {
-    scalar_from_hash(Digest::finalize(hasher))
+    let digest: [u8; 32] = {
+        let d = hasher.finalize();
+        let s: &[u8] = &d[..];
+        s.try_into().unwrap()
+    };
+    scalar_from_hash(&digest)
 }
 
-/// Convert a 32‑byte hash digest to a scalar by reducing modulo the group order.
-fn scalar_from_hash(digest: impl AsRef<[u8]>) -> Scalar {
-    // The digest is 32 bytes. We interpret it as a little‑endian integer and reduce
-    // modulo the field order. This matches the specification's `H_scalar`.
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(digest.as_ref());
-    Scalar::from_bytes_mod_order(&bytes)
+/// Write a compressed G1 projective point (48 bytes) into a writer.
+#[inline]
+pub(crate) fn write_g1(w: &mut impl std::io::Write, p: G1Projective) {
+    w.write_all(&G1Affine::from(p).to_compressed()).unwrap();
+}
+
+/// Write a compressed G1 affine point (48 bytes) into a writer.
+#[inline]
+pub(crate) fn write_g1_affine(w: &mut impl std::io::Write, p: G1Affine) {
+    w.write_all(&p.to_compressed()).unwrap();
+}
+
+/// Write a compressed G2 projective point (96 bytes) into a writer.
+#[inline]
+pub(crate) fn write_g2(w: &mut impl std::io::Write, p: G2Projective) {
+    w.write_all(&G2Affine::from(p).to_compressed()).unwrap();
+}
+
+/// Write a scalar's canonical LE bytes (32 bytes) into a writer.
+#[inline]
+pub(crate) fn write_scalar(w: &mut impl std::io::Write, s: Scalar) {
+    w.write_all(&s.to_bytes()).unwrap();
+}
+
+// ---- Internal helpers -------------------------------------------------------
+
+/// Convert a 32-byte SHA-256 digest to a scalar by reducing modulo the group order.
+fn scalar_from_hash(digest: &[u8; 32]) -> Scalar {
+    Scalar(scalar_from_le_bytes_mod_order(digest))
 }
 
 impl Scalar {
-    /// Create a scalar by reducing a 32‑byte array modulo the group order.
+    /// Create a scalar by reducing a 32-byte LE array modulo the group order.
     pub(crate) fn from_bytes_mod_order(bytes: &[u8; 32]) -> Self {
-        use ark_ff::fields::PrimeField;
-        let fr = ark_bls12_381::Fr::from_le_bytes_mod_order(bytes);
-        Scalar(fr)
+        Self(scalar_from_le_bytes_mod_order(bytes))
     }
 }
 
@@ -137,57 +210,56 @@ impl Scalar {
 mod tests {
     use super::*;
     use crate::setup::Generators;
-    use ark_bls12_381::G2Projective;
-    use ark_ec::Group;
+    use group::Group;
 
     #[test]
     fn h_ctx_deterministic() {
         let generators = Generators::new();
         let pk_master = G2Projective::generator();
-        let pk_daily = G2Projective::generator() * Scalar::from(2u64).0;
-
+        let pk_daily = &pk_master * &BlsScalar::from(2u64);
         let h1 = compute_h_ctx("test", &pk_master, &pk_daily, &generators);
         let h2 = compute_h_ctx("test", &pk_master, &pk_daily, &generators);
         assert_eq!(h1, h2);
-
         let h3 = compute_h_ctx("other", &pk_master, &pk_daily, &generators);
         assert_ne!(h1, h3);
     }
 
     #[test]
     fn hash_to_g1_domain_separation() {
-        let msg = b"epoch:42";
-        let p1 = hash_to_g1(b"ACT:Epoch:", msg);
-        let p2 = hash_to_g1(b"ACT:Other:", msg);
+        let p1 = hash_to_g1(b"ACT:Epoch:", b"epoch:42");
+        let p2 = hash_to_g1(b"ACT:Other:", b"epoch:42");
         assert_ne!(p1, p2);
-    }
-
-    #[test]
-    fn hash_to_scalar_deterministic() {
-        let preimage = b"test preimage";
-        let s1 = hash_to_scalar(preimage);
-        let s2 = hash_to_scalar(preimage);
-        assert_eq!(s1, s2);
-    }
-
-    #[test]
-    fn hash_to_g1_is_not_generator_multiple() {
-        // Verify that hash_to_g1 produces a point that is not a simple multiple
-        // of the generator (i.e., we're actually using hash-to-curve, not
-        // hash-to-scalar * G).
-        use ark_std::Zero;
-        let p = hash_to_g1(b"ACT:Test:", b"hello");
-        let g = G1Projective::generator();
-        // There is no known discrete log of p w.r.t. g from hash_to_curve,
-        // and we can at least verify p != g and p != identity.
-        assert_ne!(p, g, "hash_to_g1 must not return the generator");
-        assert!(!p.is_zero(), "hash_to_g1 must not return the identity");
     }
 
     #[test]
     fn hash_to_g1_deterministic() {
         let p1 = hash_to_g1(b"ACT:Epoch:", b"epoch:42");
         let p2 = hash_to_g1(b"ACT:Epoch:", b"epoch:42");
-        assert_eq!(p1, p2, "hash_to_g1 must be deterministic");
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn hash_to_g1_is_not_generator() {
+        let p = hash_to_g1(b"ACT:Test:", b"hello");
+        assert_ne!(p, G1Projective::generator());
+        assert!(!bool::from(p.is_identity()));
+    }
+
+    #[test]
+    fn hash_to_scalar_deterministic() {
+        let s1 = hash_to_scalar(b"test preimage");
+        let s2 = hash_to_scalar(b"test preimage");
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn scalar_from_mod_order_max_bytes() {
+        // All 0xFF bytes (which is > r); should still produce a valid scalar.
+        let bytes = [0xFFu8; 32];
+        let s = scalar_from_le_bytes_mod_order(&bytes);
+        // Verify the output is canonical by round-tripping.
+        let back = s.to_bytes_le();
+        let s2 = BlsScalar::from_bytes_le(&back).unwrap();
+        assert_eq!(s, s2);
     }
 }

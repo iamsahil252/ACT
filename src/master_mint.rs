@@ -1,23 +1,18 @@
-//! Phase 1: Master Subscription Minting
-//!
-//! This module implements the blind issuance of the Master Token.
-//! The client generates a secret identifier `k_sub` and a commitment `K_sub`,
-//! proves knowledge of its opening via a Schnorr proof, and receives a blind
-//! BBS+ signature from the server. The server enforces the policy limits
-//! `c_max` and `e_max` (both 32‑bit unsigned integers).
+//! Phase 1: Master Subscription Minting.
 
 extern crate alloc;
-use ark_bls12_381::{Fr, G1Projective};
-use ark_ec::{CurveGroup, VariableBaseMSM};
-use ark_ff::Field;
-use ark_serialize::CanonicalSerialize;
-use ark_std::rand::RngCore;
-use sha2::Digest as _;
-use ark_std::io::Write as _;
+
+use blstrs::{G1Affine, G1Projective};
+use group::Group as _;
+use rand_core::RngCore;
+use sha2::{Digest as _, Sha256};
+use std::io::Write as _;
+
 use crate::bbs_proof::BbsSignature;
 use crate::commitments::commit;
 use crate::error::{ActError, Result};
-use crate::hash::{hash_to_scalar_from_hasher, HasherWriter};
+use crate::hash::{hash_to_scalar_from_hasher, write_g1, write_scalar, HasherWriter};
+use crate::msm::g1_msm;
 use crate::setup::{Generators, ServerKeys};
 use crate::types::Scalar;
 
@@ -28,36 +23,21 @@ use crate::types::Scalar;
 /// The client's request for a Master Token.
 #[derive(Clone, Debug)]
 pub struct MasterMintRequest {
-    /// Commitment to the secret `k_sub`: `K_sub = k_sub * h1 + r_sub * h0`.
+    /// `K_sub = k_sub·h1 + r_sub·h0`
     pub k_sub_commit: G1Projective,
-    /// Proof of knowledge of `(k_sub, r_sub)`.
+    /// Schnorr proof of knowledge of the opening.
     pub pok: ProofOfKnowledge,
 }
 
-/// Schnorr proof of knowledge of the opening of `K_sub`.
-///
-/// Proves knowledge of `k_sub` and `r_sub` such that
-/// `K_sub = k_sub * h1 + r_sub * h0`.
+/// Schnorr proof of knowledge of `(k_sub, r_sub)` s.t. `K_sub = k_sub·h1 + r_sub·h0`.
 #[derive(Clone, Debug)]
 pub struct ProofOfKnowledge {
-    /// Commitment `T = alpha * h1 + beta * h0`.
     pub t: G1Projective,
-    /// Response for `k_sub`.
     pub s_k: Scalar,
-    /// Response for `r_sub`.
     pub s_r: Scalar,
 }
 
 impl ProofOfKnowledge {
-    /// Generate a proof of knowledge of the opening of `K_sub`.
-    ///
-    /// # Arguments
-    /// - `rng`: secure random number generator.
-    /// - `k_sub`: the secret subscription identifier.
-    /// - `r_sub`: the blinding factor.
-    /// - `k_sub_commit`: the commitment `K_sub`.
-    /// - `generators`: the global generators.
-    /// - `h_ctx`: the application context hash.
     pub fn prove(
         rng: &mut impl RngCore,
         k_sub: Scalar,
@@ -66,75 +46,44 @@ impl ProofOfKnowledge {
         generators: &Generators,
         h_ctx: Scalar,
     ) -> Self {
-        // Choose random blinders
         let alpha = Scalar::rand(rng);
-        let beta = Scalar::rand(rng);
+        let beta  = Scalar::rand(rng);
 
-        // T = alpha * h1 + beta * h0 (2-base MSM with cached affines)
-        let t = {
-            let bases = [generators.h_affine[1], generators.h_affine[0]];
-            let scalars = [alpha.0, beta.0];
-            G1Projective::msm(&bases, &scalars).expect("T MSM length mismatch")
-        };
+        let t = g1_msm(
+            &[generators.h_affine[1], generators.h_affine[0]],
+            &[alpha.0, beta.0],
+        );
 
-        // Compute challenge c = H(H_ctx || K_sub || T || "PoK:MasterSecret")
-        let c = {
-            let mut hasher = sha2::Sha256::new();
-            let mut w = HasherWriter(&mut hasher);
-            w.write_all(&h_ctx.to_bytes()).unwrap();
-            k_sub_commit.serialize_compressed(&mut w).unwrap();
-            t.serialize_compressed(&mut w).unwrap();
-            w.write_all(b"PoK:MasterSecret").unwrap();
-            drop(w);
-            hash_to_scalar_from_hasher(hasher)
-        };
-
-        // Responses
+        let c = Self::challenge(h_ctx, k_sub_commit, t);
         let s_k = alpha + c * k_sub;
-        let s_r = beta + c * r_sub;
-
+        let s_r = beta  + c * r_sub;
         Self { t, s_k, s_r }
     }
 
-    /// Verify the proof of knowledge.
-    ///
-    /// # Arguments
-    /// - `k_sub_commit`: the commitment `K_sub` being proven.
-    /// - `generators`: the global generators.
-    /// - `h_ctx`: the application context hash.
-    pub fn verify(
-        &self,
-        k_sub_commit: G1Projective,
-        generators: &Generators,
-        h_ctx: Scalar,
-    ) -> Result<()> {
-        // Recompute challenge
-        let c = {
-            let mut hasher = sha2::Sha256::new();
-            let mut w = HasherWriter(&mut hasher);
-            w.write_all(&h_ctx.to_bytes()).unwrap();
-            k_sub_commit.serialize_compressed(&mut w).unwrap();
-            self.t.serialize_compressed(&mut w).unwrap();
-            w.write_all(b"PoK:MasterSecret").unwrap();
-            drop(w);
-            hash_to_scalar_from_hasher(hasher)
-        };
+    pub fn verify(&self, k_sub_commit: G1Projective, generators: &Generators, h_ctx: Scalar) -> Result<()> {
+        let c = Self::challenge(h_ctx, k_sub_commit, self.t);
 
-        // Check: s_k * h1 + s_r * h0 == T + c * K_sub
-        // Use cached affine generators.
-        let lhs = {
-            let bases = [generators.h_affine[1], generators.h_affine[0]];
-            let scalars = [self.s_k.0, self.s_r.0];
-            G1Projective::msm(&bases, &scalars).expect("verify MSM length mismatch")
-        };
-        let rhs = self.t + k_sub_commit * c.0;
+        let lhs = g1_msm(
+            &[generators.h_affine[1], generators.h_affine[0]],
+            &[self.s_k.0, self.s_r.0],
+        );
+        let rhs = &self.t + &(&k_sub_commit * &c.0);
 
         if lhs != rhs {
-            return Err(ActError::VerificationFailed(
-                "PoK verification failed".into(),
-            ));
+            return Err(ActError::VerificationFailed("PoK verification failed".into()));
         }
         Ok(())
+    }
+
+    fn challenge(h_ctx: Scalar, k_sub_commit: G1Projective, t: G1Projective) -> Scalar {
+        let mut hasher = Sha256::new();
+        let mut w = HasherWriter(&mut hasher);
+        write_scalar(&mut w, h_ctx);
+        write_g1(&mut w, k_sub_commit);
+        write_g1(&mut w, t);
+        w.write_all(b"PoK:MasterSecret").unwrap();
+        drop(w);
+        hash_to_scalar_from_hasher(hasher)
     }
 }
 
@@ -147,10 +96,6 @@ pub struct MasterMintClient {
 }
 
 impl MasterMintClient {
-    /// Start the minting process.
-    ///
-    /// Generates the secret `k_sub`, blinding `r_sub`, and the request to send
-    /// to the server.
     pub fn begin(
         rng: &mut impl RngCore,
         c_max: u32,
@@ -160,46 +105,16 @@ impl MasterMintClient {
     ) -> (Self, MasterMintRequest) {
         let k_sub = Scalar::rand_nonzero(rng);
         let r_sub = Scalar::rand(rng);
-
         let k_sub_commit = commit(k_sub, r_sub, generators.h[1], generators.h[0]);
-
-        let pok = ProofOfKnowledge::prove(
-            rng,
-            k_sub,
-            r_sub,
-            k_sub_commit,
-            generators,
-            h_ctx,
-        );
-
-        let request = MasterMintRequest {
-            k_sub_commit,
-            pok,
-        };
-
-        let client = Self {
-            k_sub,
-            r_sub,
-            c_max,
-            e_max,
-        };
-
-        (client, request)
+        let pok = ProofOfKnowledge::prove(rng, k_sub, r_sub, k_sub_commit, generators, h_ctx);
+        (
+            Self { k_sub, r_sub, c_max, e_max },
+            MasterMintRequest { k_sub_commit, pok },
+        )
     }
 
-    /// Finalize the Master Token after receiving the server's blind signature.
-    pub fn finalize(
-        self,
-        a_sub: G1Projective,
-        e_sub: Scalar,
-        s_prime_sub: Scalar,
-    ) -> BbsSignature {
-        let s_sub = self.r_sub + s_prime_sub;
-        BbsSignature {
-            a: a_sub,
-            e: e_sub,
-            s: s_sub,
-        }
+    pub fn finalize(self, a_sub: G1Projective, e_sub: Scalar, s_prime_sub: Scalar) -> BbsSignature {
+        BbsSignature { a: a_sub, e: e_sub, s: self.r_sub + s_prime_sub }
     }
 }
 
@@ -207,23 +122,10 @@ impl MasterMintClient {
 // Server
 // ============================================================================
 
-/// Server handling of master minting requests.
 pub struct MasterMintServer;
 
 impl MasterMintServer {
     /// Process a mint request and issue a blind BBS+ signature.
-    ///
-    /// # Arguments
-    /// - `rng`: secure random number generator.
-    /// - `request`: the client's request containing `K_sub` and PoK.
-    /// - `c_max`: maximum credits per epoch (server policy).
-    /// - `e_max`: expiry epoch (server policy).
-    /// - `generators`: the global generators.
-    /// - `keys`: the server's master signing key.
-    /// - `h_ctx`: the application context hash.
-    ///
-    /// # Returns
-    /// A tuple `(A_sub, e_sub, s'_sub)` to send to the client.
     pub fn issue(
         rng: &mut impl RngCore,
         request: &MasterMintRequest,
@@ -233,49 +135,38 @@ impl MasterMintServer {
         keys: &ServerKeys,
         h_ctx: Scalar,
     ) -> Result<(G1Projective, Scalar, Scalar)> {
-        // 1. Verify the proof of knowledge.
-        request
-            .pok
-            .verify(request.k_sub_commit, generators, h_ctx)?;
+        request.pok.verify(request.k_sub_commit, generators, h_ctx)?;
 
-        // 2. Enforce policy: c_max must be ≤ 2^32-1 (always true for u32).
-        //    Also ensure c_max is non-zero (subscription must allow at least one spend).
         if c_max == 0 {
-            return Err(ActError::ProtocolError(
-                "c_max must be positive".into(),
-            ));
+            return Err(ActError::ProtocolError("c_max must be positive".into()));
         }
 
-        // 3. Generate signature randomness.
-        let e_sub = Scalar::rand(rng);
+        let e_sub       = Scalar::rand(rng);
         let s_prime_sub = Scalar::rand(rng);
 
-        // 4. Compute A_sub = (g1 * K_sub * h0^{s'} * h2^{c_max} * h3^{e_max})^{1/(e + sk_master)}
-        //    Note: the message vector is (k_sub, c_max, e_max) on (h1, h2, h3).
-        //    Use cached affine generators for static bases; only K_sub (dynamic) needs affine conversion.
-        let k_sub_commit_affine = request.k_sub_commit.into_affine();
-        let bases = [
+        let k_sub_aff = G1Affine::from(request.k_sub_commit);
+        let bases  = [
             generators.g1_affine,
-            k_sub_commit_affine,
+            k_sub_aff,
             generators.h_affine[0],
             generators.h_affine[2],
             generators.h_affine[3],
         ];
         let scalars = [
-            Fr::from(1u64),
-            Fr::from(1u64),
+            Scalar::ONE.0,
+            Scalar::ONE.0,
             s_prime_sub.0,
             Scalar::from(c_max).0,
             Scalar::from(e_max).0,
         ];
-        let msg_part = G1Projective::msm(&bases, &scalars).expect("issue MSM length mismatch");
+        let msg_part = g1_msm(&bases, &scalars);
 
         let denom = e_sub + keys.sk_master;
-        let denom_inv = denom
-            .0
-            .inverse()
-            .ok_or_else(|| ActError::ProtocolError("Division by zero".into()))?;
-        let a_sub = msg_part * denom_inv;
+        if denom.is_zero() {
+            return Err(ActError::ProtocolError("Division by zero".into()));
+        }
+        let denom_inv = denom.inverse();
+        let a_sub = &msg_part * &denom_inv.0;
 
         Ok((a_sub, e_sub, s_prime_sub))
     }
@@ -290,53 +181,22 @@ mod tests {
     use super::*;
     use crate::hash::compute_h_ctx;
     use crate::setup::{Generators, ServerKeys};
-    use ark_std::rand::thread_rng;
-    use ark_std::Zero;
+    use group::Group as _;
+    use rand::thread_rng;
 
     #[test]
     fn master_mint_roundtrip() {
         let mut rng = thread_rng();
         let generators = Generators::new();
         let keys = ServerKeys::generate(&mut rng);
-        let h_ctx = compute_h_ctx(
-            "test-app",
-            &keys.pk_master,
-            &keys.pk_daily,
-            &generators,
-        );
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
 
-        let c_max = 100u32;
-        let e_max = 12345u32;
-
-        // Client begins
-        let (client, request) = MasterMintClient::begin(
-            &mut rng,
-            c_max,
-            e_max,
-            &generators,
-            h_ctx,
-        );
-
-        // Server issues blind signature
-        let (a_sub, e_sub, s_prime_sub) = MasterMintServer::issue(
-            &mut rng,
-            &request,
-            c_max,
-            e_max,
-            &generators,
-            &keys,
-            h_ctx,
-        )
-        .unwrap();
-
-        // Client finalizes
-        let master_sig = client.finalize(a_sub, e_sub, s_prime_sub);
-
-        // Verify the signature (using BBS+ verification)
-        // We'll do a quick check: the signature should verify under pk_master.
-        // For a full verification we'd need the BBS+ verification function.
-        // Since we don't have it exposed, we just check it's not the identity.
-        assert!(!master_sig.a.is_zero());
+        let (client, request) = MasterMintClient::begin(&mut rng, 100, 12345, &generators, h_ctx);
+        let (a_sub, e_sub, s_prime) = MasterMintServer::issue(
+            &mut rng, &request, 100, 12345, &generators, &keys, h_ctx,
+        ).unwrap();
+        let master_sig = client.finalize(a_sub, e_sub, s_prime);
+        assert!(!bool::from(master_sig.a.is_identity()));
         assert!(!master_sig.e.is_zero());
     }
 
@@ -345,25 +205,13 @@ mod tests {
         let mut rng = thread_rng();
         let generators = Generators::new();
         let h_ctx = Scalar::rand(&mut rng);
-
         let k_sub = Scalar::rand(&mut rng);
         let r_sub = Scalar::rand(&mut rng);
         let k_sub_commit = commit(k_sub, r_sub, generators.h[1], generators.h[0]);
-
-        let pok = ProofOfKnowledge::prove(
-            &mut rng,
-            k_sub,
-            r_sub,
-            k_sub_commit,
-            &generators,
-            h_ctx,
-        );
-
+        let pok = ProofOfKnowledge::prove(&mut rng, k_sub, r_sub, k_sub_commit, &generators, h_ctx);
         assert!(pok.verify(k_sub_commit, &generators, h_ctx).is_ok());
-
-        // Tampered commitment should fail
-        let wrong_commit = generators.h[1] * Scalar::from(999u64).0;
-        assert!(pok.verify(wrong_commit, &generators, h_ctx).is_err());
+        let wrong = &generators.h[1] * &Scalar::from(999u64).0;
+        assert!(pok.verify(wrong, &generators, h_ctx).is_err());
     }
 
     #[test]
@@ -372,29 +220,14 @@ mod tests {
         let generators = Generators::new();
         let keys = ServerKeys::generate(&mut rng);
         let h_ctx = Scalar::rand(&mut rng);
-
-        let c_max = 100;
-        let e_max = 1000;
-
-        // Create a fake request with a bad PoK
         let bad_request = MasterMintRequest {
-            k_sub_commit: generators.h[1] * Scalar::from(42u64).0,
+            k_sub_commit: &generators.h[1] * &Scalar::from(42u64).0,
             pok: ProofOfKnowledge {
                 t: generators.g1,
                 s_k: Scalar::ZERO,
                 s_r: Scalar::ZERO,
             },
         };
-
-        let result = MasterMintServer::issue(
-            &mut rng,
-            &bad_request,
-            c_max,
-            e_max,
-            &generators,
-            &keys,
-            h_ctx,
-        );
-        assert!(result.is_err());
+        assert!(MasterMintServer::issue(&mut rng, &bad_request, 100, 1000, &generators, &keys, h_ctx).is_err());
     }
 }

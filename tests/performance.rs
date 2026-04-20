@@ -11,11 +11,9 @@
 
 use std::time::{Duration, Instant};
 
-use ark_bls12_381::{Bls12_381, Fq12, G1Projective};
-use ark_ec::{pairing::Pairing, CurveGroup, VariableBaseMSM};
-use ark_ff::Field;
-use ark_std::rand::thread_rng;
-use rand::RngCore;
+use blstrs::{G1Projective, Scalar as BlsScalar};
+use ff::Field as _;
+use rand::thread_rng;
 
 use act::{
     batched_eq::{prove_batched_equality, verify_batched_equality},
@@ -86,23 +84,22 @@ fn spend_proof_size(proof: &act::spend::SpendProof) -> usize {
 // ─── test fixtures ───────────────────────────────────────────────────────────
 
 fn make_daily_sig(
-    rng: &mut impl ark_std::rand::RngCore,
+    rng: &mut impl rand_core::RngCore,
     k_daily: Scalar,
     c_bal: u32,
     t_issue: u32,
     generators: &Generators,
     keys: &ServerKeys,
 ) -> BbsSignature {
-    use ark_bls12_381::Fr;
     let r = Scalar::rand(rng);
-    let k_commit = generators.h[4] * Fr::from(c_bal as u64)
-        + generators.h[1] * k_daily.0
-        + generators.h[2] * Fr::from(t_issue as u64)
-        + generators.h[0] * r.0;
+    let k_commit = &(&generators.h[4] * &BlsScalar::from(c_bal as u64))
+        + &(&(&generators.h[1] * &k_daily.0)
+        + &(&(&generators.h[2] * &BlsScalar::from(t_issue as u64))
+        + &(&generators.h[0] * &r.0)));
     let e = Scalar::rand(rng);
     let s_prime = Scalar::rand(rng);
-    let msg = generators.g1 + k_commit + generators.h[0] * s_prime.0;
-    let a = msg * (e + keys.sk_daily).0.inverse().unwrap();
+    let msg = &(&generators.g1 + &k_commit) + &(&generators.h[0] * &s_prime.0);
+    let a = &msg * &(e + keys.sk_daily).inverse().0;
     BbsSignature { a, e, s: r + s_prime }
 }
 
