@@ -423,6 +423,247 @@ pub fn verify_refresh(
 }
 
 // ============================================================================
+// Batch Server Verifier
+// ============================================================================
+
+/// Batch-verify a slice of [`RefreshProof`]s sharing the same epoch and keys.
+///
+/// # Batching strategy
+///
+/// * **Schnorr MSM** – all per-proof Schwartz–Zippel equations are combined
+///   into a single Pippenger MSM via a random linear combination (RLC) with
+///   weights `ρ_i` derived by hashing the per-proof Fiat–Shamir challenges.
+///   Soundness error is negligible (one `≤ N/|Fr|` per batch).
+///
+/// * **Pairing check** – G1 points are aggregated as `∑ ρ_i·A'_i` and
+///   `∑ ρ_i·Ā_i`, then checked with a single 2-pair `multi_miller_loop` +
+///   one `final_exponentiation` (saves N−1 expensive final exponentiations).
+///
+/// * **BEQ range proofs** – each [`BatchedEqualityProof`] is independent;
+///   they are verified concurrently via `rayon`.
+///
+/// Returns `Ok(Vec<RefreshResponse>)` where each response corresponds to the
+/// proof at the same index.  Returns `Err` if **any** proof is invalid,
+/// without revealing which one.
+///
+/// Falls back to calling [`verify_refresh`] directly for 0 or 1 proofs.
+pub fn verify_refresh_batch(
+    proofs: &[RefreshProof],
+    current_epoch: u32,
+    generators: &Generators,
+    pk_master: &G2Projective,
+    keys: &ServerKeys,
+    h_ctx: Scalar,
+    rng: &mut impl RngCore,
+) -> Result<Vec<RefreshResponse>> {
+    use rayon::prelude::*;
+
+    if proofs.is_empty() {
+        return Ok(Vec::new());
+    }
+    if proofs.len() == 1 {
+        return verify_refresh(&proofs[0], current_epoch, generators, pk_master, keys, h_ctx, rng)
+            .map(|r| vec![r]);
+    }
+
+    let n = proofs.len();
+
+    // ── Step 1: Per-proof basic validation + Fiat–Shamir challenge ──────────
+    // h_t is the same for all proofs (same current_epoch).
+    let h_t = hash_to_g1(b"ACT:Epoch:", &current_epoch.to_le_bytes());
+    let ep  = BlsScalar::from(current_epoch as u64);
+
+    struct PerProof {
+        c_fr:     BlsScalar,
+        c_bridge: G1Projective,
+    }
+    let mut per_proof = Vec::with_capacity(n);
+    for proof in proofs {
+        if bool::from(proof.n_t.is_identity()) {
+            return Err(ActError::VerificationFailed("N_T is the identity".into()));
+        }
+        if bool::from(proof.a_prime.is_identity()) || bool::from(proof.t_bbs.is_identity()) {
+            return Err(ActError::VerificationFailed("Zero point in proof".into()));
+        }
+        let c_bridge  = &proof.c_delta + &(&generators.h[3] * &Scalar::from(current_epoch).0);
+        let beq_bytes = proof.batched_eq.to_bytes();
+        let c = RefreshProver::challenge(
+            h_ctx, pk_master, current_epoch,
+            proof.n_t, proof.k_daily, proof.c_delta,
+            &beq_bytes,
+            proof.a_prime, proof.a_bar, proof.t_bbs,
+            proof.t_scale_n, proof.t_n, proof.t_scale_d, proof.t_d,
+            proof.t_scale_b, proof.t_b,
+        );
+        per_proof.push(PerProof { c_fr: c.0, c_bridge });
+    }
+
+    // ── Step 2: Derive RLC weights ρ_i ──────────────────────────────────────
+    // Hash all per-proof challenges so that ρ_i is unpredictable to any prover
+    // that submits proofs individually (Schwartz–Zippel soundness).
+    let rho_seed: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(b"ACT:BatchVerify:Refresh:RLC");
+        for pp in &per_proof {
+            h.update(pp.c_fr.to_bytes_le());
+        }
+        h.finalize().into()
+    };
+    let mut rho_rng = rand_chacha::ChaCha20Rng::from_seed(rho_seed);
+    let rhos: Vec<BlsScalar> = (0..n).map(|_| BlsScalar::random(&mut rho_rng)).collect();
+
+    // ── Step 3: Batched Schnorr-bridge MSM ──────────────────────────────────
+    // Static base accumulators: ∑ ρ_i · sc_*_i for h0, h1, h2, h3, h4, g1.
+    let mut acc_h0 = BlsScalar::ZERO;
+    let mut acc_h1 = BlsScalar::ZERO;
+    let mut acc_h2 = BlsScalar::ZERO;
+    let mut acc_h3 = BlsScalar::ZERO;
+    let mut acc_h4 = BlsScalar::ZERO;
+    let mut acc_g1 = BlsScalar::ZERO;
+
+    // Dynamic bases (13 per proof): each gets scalar ρ_i · sc_*_i.
+    let mut dyn_bases:   Vec<G1Affine>   = Vec::with_capacity(13 * n);
+    let mut dyn_scalars: Vec<BlsScalar>  = Vec::with_capacity(13 * n);
+
+    for (i, (proof, pp)) in proofs.iter().zip(per_proof.iter()).enumerate() {
+        let rho   = rhos[i];
+        let c_fr  = pp.c_fr;
+        let c2    = &c_fr * &c_fr;
+        let c3    = &c2   * &c_fr;
+
+        let sc_ht       = &c_fr  * &proof.z_k_tilde.0;
+        let sc_nt       = -(&c_fr * &proof.z_r1.0);
+        let sc_tscale_n =  c_fr;
+        let sc_tn       = -c_fr;
+        let sc_h0 = &(&c2 * &proof.z_v.0) + &(&(&c3 * &proof.z_w.0) + &proof.z_s_tilde.0);
+        let sc_h1 = &(&c2 * &proof.z_u.0) + &proof.z_k_tilde.0;
+        let sc_h2 = &(&c2 * &(&proof.z_r1.0 * &ep)) + &proof.z_c_tilde.0;
+        let sc_h3 = &(&c3 + &BlsScalar::ONE) * &proof.z_e_tilde.0;
+        let sc_h4 = &c2 * &proof.z_c_tilde.0;
+        let sc_g1 = proof.z_r1.0;
+        let sc_aprime   = -proof.z_e.0;
+        let sc_kdaily   = -(&c2 * &proof.z_r1.0);
+        let sc_cbridge  = -(&c3 * &proof.z_r1.0);
+        let sc_abar     = -c_fr;
+        let sc_td       = -c2;
+        let sc_tscale_d =  c2;
+        let sc_tb       = -c3;
+        let sc_tscale_b =  c3;
+        let sc_tbbs     = -BlsScalar::ONE;
+
+        acc_h0 = &acc_h0 + &(&rho * &sc_h0);
+        acc_h1 = &acc_h1 + &(&rho * &sc_h1);
+        acc_h2 = &acc_h2 + &(&rho * &sc_h2);
+        acc_h3 = &acc_h3 + &(&rho * &sc_h3);
+        acc_h4 = &acc_h4 + &(&rho * &sc_h4);
+        acc_g1 = &acc_g1 + &(&rho * &sc_g1);
+
+        let dyn_pts = batch_normalize(&[
+            h_t,
+            proof.n_t, proof.t_scale_n, proof.t_n,
+            proof.a_prime, proof.k_daily, pp.c_bridge,
+            proof.a_bar,
+            proof.t_d, proof.t_scale_d, proof.t_b, proof.t_scale_b,
+            proof.t_bbs,
+        ]);
+        for (sc, pt) in [
+            (sc_ht,       dyn_pts[0]),
+            (sc_nt,       dyn_pts[1]),
+            (sc_tscale_n, dyn_pts[2]),
+            (sc_tn,       dyn_pts[3]),
+            (sc_aprime,   dyn_pts[4]),
+            (sc_kdaily,   dyn_pts[5]),
+            (sc_cbridge,  dyn_pts[6]),
+            (sc_abar,     dyn_pts[7]),
+            (sc_td,       dyn_pts[8]),
+            (sc_tscale_d, dyn_pts[9]),
+            (sc_tb,       dyn_pts[10]),
+            (sc_tscale_b, dyn_pts[11]),
+            (sc_tbbs,     dyn_pts[12]),
+        ] {
+            dyn_bases.push(pt);
+            dyn_scalars.push(&rho * &sc);
+        }
+    }
+
+    let mut msm_bases:   Vec<G1Affine>  = Vec::with_capacity(6 + dyn_bases.len());
+    let mut msm_scalars: Vec<BlsScalar> = Vec::with_capacity(6 + dyn_scalars.len());
+    msm_bases.extend_from_slice(&[
+        generators.h_affine[0], generators.h_affine[1], generators.h_affine[2],
+        generators.h_affine[3], generators.h_affine[4], generators.g1_affine,
+    ]);
+    msm_scalars.extend_from_slice(&[acc_h0, acc_h1, acc_h2, acc_h3, acc_h4, acc_g1]);
+    msm_bases.extend_from_slice(&dyn_bases);
+    msm_scalars.extend_from_slice(&dyn_scalars);
+
+    let combined = g1_msm(&msm_bases, &msm_scalars);
+    if !bool::from(combined.is_identity()) {
+        return Err(ActError::VerificationFailed("Batched Schnorr check failed".into()));
+    }
+
+    // ── Step 4: Batched pairing check ────────────────────────────────────────
+    // Aggregate G1: a_prime_agg = ∑ ρ_i · A'_i, a_bar_agg = ∑ ρ_i · (−Ā_i).
+    // One 2-pair multi_miller_loop + one final_exponentiation replaces N calls.
+    let a_prime_aff: Vec<G1Affine> = proofs.iter().map(|p| G1Affine::from(p.a_prime)).collect();
+    let a_bar_neg_aff: Vec<G1Affine> = proofs.iter().map(|p| G1Affine::from(-p.a_bar)).collect();
+    let a_prime_agg = g1_msm(&a_prime_aff,   &rhos);
+    let a_bar_agg   = g1_msm(&a_bar_neg_aff, &rhos);
+    let pairing_result = Bls12::multi_miller_loop(&[
+        (&G1Affine::from(a_prime_agg), &keys.pk_master_prepared),
+        (&G1Affine::from(a_bar_agg),   &generators.g2_prepared),
+    ])
+    .final_exponentiation();
+    if pairing_result != Gt::identity() {
+        return Err(ActError::VerificationFailed("Batched pairing check failed".into()));
+    }
+
+    // ── Step 5: Verify all BEQ proofs concurrently ───────────────────────────
+    let beq_check_results: Vec<Result<()>> = proofs
+        .par_iter()
+        .map(|proof| {
+            let mut beq_ctx = Vec::new();
+            beq_ctx.extend_from_slice(&h_ctx.to_bytes());
+            beq_ctx.extend_from_slice(&current_epoch.to_le_bytes());
+            let beq_commitments = [
+                G1Affine::from(proof.a_prime),
+                G1Affine::from(proof.a_bar),
+                G1Affine::from(proof.t_bbs),
+                G1Affine::from(proof.n_t),
+                G1Affine::from(proof.k_daily),
+            ];
+            verify_batched_equality(
+                &proof.batched_eq, proof.c_delta,
+                generators.h[3], generators.h[0],
+                &beq_ctx, &beq_commitments,
+            )
+        })
+        .collect();
+    for r in beq_check_results {
+        r?;
+    }
+
+    // ── Step 6: Issue responses individually (requires sk_daily) ────────────
+    let mut responses = Vec::with_capacity(n);
+    for proof in proofs {
+        let e_daily       = Scalar::rand(rng);
+        let s_prime_daily = Scalar::rand(rng);
+        let k_daily_aff   = G1Affine::from(proof.k_daily);
+        let msg_part = g1_msm(
+            &[generators.g1_affine, k_daily_aff, generators.h_affine[0]],
+            &[BlsScalar::ONE, BlsScalar::ONE, s_prime_daily.0],
+        );
+        let denom = e_daily + keys.sk_daily;
+        if denom.is_zero() {
+            return Err(ActError::ProtocolError("Division by zero in issuance".into()));
+        }
+        let a_daily = &msg_part * &denom.inverse().0;
+        responses.push(RefreshResponse { a_daily, e_daily, s_prime_daily });
+    }
+
+    Ok(responses)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -491,6 +732,96 @@ mod tests {
         let master = create_master_sig(&mut rng, k_sub, 100, 1000, &generators, &keys);
         assert!(RefreshProver::prove(
             &mut rng, &master, k_sub, 100, 1000, 2000, &generators, &keys.pk_master, h_ctx,
+        ).is_err());
+    }
+
+    #[test]
+    fn batch_refresh_empty() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let responses = verify_refresh_batch(&[], 1000, &generators, &keys.pk_master, &keys, h_ctx, &mut rng).unwrap();
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn batch_refresh_single() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let k_sub = Scalar::rand_nonzero(&mut rng);
+        let epoch = 500u32;
+        let master = create_master_sig(&mut rng, k_sub, 100, 5000, &generators, &keys);
+        let (_client, proof) = RefreshProver::prove(
+            &mut rng, &master, k_sub, 100, 5000, epoch, &generators, &keys.pk_master, h_ctx,
+        ).unwrap();
+        let responses = verify_refresh_batch(
+            &[proof], epoch, &generators, &keys.pk_master, &keys, h_ctx, &mut rng,
+        ).unwrap();
+        assert_eq!(responses.len(), 1);
+        assert!(!bool::from(responses[0].a_daily.is_identity()));
+    }
+
+    #[test]
+    fn batch_refresh_multiple() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let epoch = 1000u32;
+
+        const BATCH: usize = 4;
+        let mut proofs = Vec::with_capacity(BATCH);
+        for _ in 0..BATCH {
+            let k_sub = Scalar::rand_nonzero(&mut rng);
+            let master = create_master_sig(&mut rng, k_sub, 100, 5000, &generators, &keys);
+            let (_client, proof) = RefreshProver::prove(
+                &mut rng, &master, k_sub, 100, 5000, epoch, &generators, &keys.pk_master, h_ctx,
+            ).unwrap();
+            proofs.push(proof);
+        }
+
+        let responses = verify_refresh_batch(
+            &proofs, epoch, &generators, &keys.pk_master, &keys, h_ctx, &mut rng,
+        ).unwrap();
+        assert_eq!(responses.len(), BATCH);
+        for r in &responses {
+            assert!(!bool::from(r.a_daily.is_identity()));
+        }
+    }
+
+    #[test]
+    fn batch_refresh_rejects_bad_proof() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let keys2 = ServerKeys::generate(&mut rng); // different keys → wrong sig
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let epoch = 1000u32;
+
+        let mut proofs = Vec::new();
+        for _ in 0..3usize {
+            let k_sub = Scalar::rand_nonzero(&mut rng);
+            let master = create_master_sig(&mut rng, k_sub, 100, 5000, &generators, &keys);
+            let (_client, proof) = RefreshProver::prove(
+                &mut rng, &master, k_sub, 100, 5000, epoch, &generators, &keys.pk_master, h_ctx,
+            ).unwrap();
+            proofs.push(proof);
+        }
+        // Replace one proof with one signed under different keys → batch must fail.
+        {
+            let k_sub = Scalar::rand_nonzero(&mut rng);
+            let master = create_master_sig(&mut rng, k_sub, 100, 5000, &generators, &keys2);
+            let (_client, bad_proof) = RefreshProver::prove(
+                &mut rng, &master, k_sub, 100, 5000, epoch, &generators, &keys2.pk_master, h_ctx,
+            ).unwrap();
+            proofs.push(bad_proof);
+        }
+
+        assert!(verify_refresh_batch(
+            &proofs, epoch, &generators, &keys.pk_master, &keys, h_ctx, &mut rng,
         ).is_err());
     }
 }

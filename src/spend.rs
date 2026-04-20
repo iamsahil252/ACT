@@ -423,6 +423,252 @@ pub fn verify_spend(
 }
 
 // ============================================================================
+// Batch Server Verifier
+// ============================================================================
+
+/// Batch-verify a slice of [`SpendProof`]s sharing the same epoch and keys.
+///
+/// `nonces` must be the same length as `proofs`; each entry is the anti-replay
+/// nonce for the corresponding proof.
+///
+/// # Batching strategy
+///
+/// * **Schnorr MSM** – per-proof Schwartz–Zippel equations combined into one
+///   Pippenger MSM via RLC weights `ρ_i` derived from the per-proof challenges.
+///
+/// * **Pairing check** – G1 points aggregated via the same RLC weights;
+///   a single 2-pair `multi_miller_loop` + one `final_exponentiation` replaces
+///   N individual pairing checks.
+///
+/// * **BEQ range proofs** – verified concurrently via `rayon`.
+///
+/// Returns `Ok(Vec<SpendResponse>)` on success.  Returns `Err` if any proof is
+/// invalid.
+///
+/// Falls back to [`verify_spend`] directly for 0 or 1 proofs.
+pub fn verify_spend_batch(
+    proofs: &[SpendProof],
+    current_epoch: u32,
+    nonces: &[[u8; 16]],
+    generators: &Generators,
+    pk_daily: &G2Projective,
+    keys: &ServerKeys,
+    h_ctx: Scalar,
+    rng: &mut impl RngCore,
+) -> Result<Vec<SpendResponse>> {
+    use rayon::prelude::*;
+
+    if proofs.len() != nonces.len() {
+        return Err(ActError::ProtocolError(
+            "verify_spend_batch: proofs and nonces must have the same length".into(),
+        ));
+    }
+    if proofs.is_empty() {
+        return Ok(Vec::new());
+    }
+    if proofs.len() == 1 {
+        return verify_spend(&proofs[0], current_epoch, &nonces[0], generators, pk_daily, keys, h_ctx, rng)
+            .map(|r| vec![r]);
+    }
+
+    let n = proofs.len();
+
+    // ── Step 1: Per-proof basic validation + Fiat–Shamir challenges ──────────
+    struct PerProof {
+        c_fr:    BlsScalar,
+        c_total: G1Projective,
+    }
+    let mut per_proof = Vec::with_capacity(n);
+    for (proof, nonce) in proofs.iter().zip(nonces.iter()) {
+        if proof.s == 0 {
+            return Err(ActError::VerificationFailed("Spend amount must be positive".into()));
+        }
+        if proof.t_issue != current_epoch && proof.t_issue.saturating_add(1) != current_epoch {
+            return Err(ActError::VerificationFailed("Epoch mismatch".into()));
+        }
+        if bool::from(proof.a_prime.is_identity()) || bool::from(proof.t_bbs.is_identity()) {
+            return Err(ActError::VerificationFailed("Zero point in proof".into()));
+        }
+        let c_total   = &proof.k_prime + &(&generators.h[4] * &Scalar::from(proof.s).0);
+        let beq_bytes = proof.batched_eq.to_bytes();
+        let c = SpendProver::challenge(
+            h_ctx, pk_daily, proof.s, &proof.k_cur, proof.t_issue, nonce,
+            proof.k_prime, c_total, proof.c_bp, &beq_bytes,
+            proof.a_prime, proof.a_bar, proof.t_bbs,
+            proof.t_scale_t, proof.t_total, proof.t_scale_r, proof.t_refund,
+            proof.t_scale_bp, proof.t_bp,
+        );
+        per_proof.push(PerProof { c_fr: c.0, c_total });
+    }
+
+    // ── Step 2: Derive RLC weights ρ_i ──────────────────────────────────────
+    let rho_seed: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(b"ACT:BatchVerify:Spend:RLC");
+        for pp in &per_proof {
+            h.update(pp.c_fr.to_bytes_le());
+        }
+        h.finalize().into()
+    };
+    let mut rho_rng = rand_chacha::ChaCha20Rng::from_seed(rho_seed);
+    let rhos: Vec<BlsScalar> = (0..n).map(|_| BlsScalar::random(&mut rho_rng)).collect();
+
+    // ── Step 3: Batched Schnorr-bridge MSM ──────────────────────────────────
+    // Static bases: h0, h1, h2, h4, g1 (h3 does not appear in spend).
+    let mut acc_h0 = BlsScalar::ZERO;
+    let mut acc_h1 = BlsScalar::ZERO;
+    let mut acc_h2 = BlsScalar::ZERO;
+    let mut acc_h4 = BlsScalar::ZERO;
+    let mut acc_g1 = BlsScalar::ZERO;
+
+    // Dynamic bases (12 per proof).
+    let mut dyn_bases:   Vec<G1Affine>  = Vec::with_capacity(12 * n);
+    let mut dyn_scalars: Vec<BlsScalar> = Vec::with_capacity(12 * n);
+
+    for (i, (proof, pp)) in proofs.iter().zip(per_proof.iter()).enumerate() {
+        let rho  = rhos[i];
+        let c_fr = pp.c_fr;
+        let c2   = &c_fr * &c_fr;
+        let c3   = &c2   * &c_fr;
+        let ti   = BlsScalar::from(proof.t_issue as u64);
+        let sf   = BlsScalar::from(proof.s as u64);
+
+        let sc_h0 = &(&(&c_fr + &c2) * &proof.z_v.0)
+            + &(&(&c3 * &proof.z_w.0) + &proof.z_s_tilde.0);
+        let sc_h1 = &(&(&c_fr + &c2) * &proof.z_u.0)
+            + &(&proof.k_cur.0 * &proof.z_r1.0);
+        let sc_h2 = &(&(&c_fr + &(&c2 + &BlsScalar::ONE)) * &ti) * &proof.z_r1.0;
+        let sc_h4 = {
+            let t1 = &(&c_fr + &(&BlsScalar::ONE + &(&c2 + &c3))) * &proof.z_c_tilde.0;
+            let t2 = &(&c2 + &c3) * &(&sf * &proof.z_r1.0);
+            &t1 - &t2
+        };
+        let sc_g1       = proof.z_r1.0;
+        let sc_aprime   = -proof.z_e.0;
+        let sc_ctotal   = -(&c_fr * &proof.z_r1.0);
+        let sc_kprime   = -(&c2   * &proof.z_r1.0);
+        let sc_cbp      = -(&c3   * &proof.z_r1.0);
+        let sc_abar     = -c_fr;
+        let sc_ttotal   = -c_fr;
+        let sc_tscale_t =  c_fr;
+        let sc_trefund  = -c2;
+        let sc_tscale_r =  c2;
+        let sc_tbp      = -c3;
+        let sc_tscale_bp = c3;
+        let sc_tbbs     = -BlsScalar::ONE;
+
+        acc_h0 = &acc_h0 + &(&rho * &sc_h0);
+        acc_h1 = &acc_h1 + &(&rho * &sc_h1);
+        acc_h2 = &acc_h2 + &(&rho * &sc_h2);
+        acc_h4 = &acc_h4 + &(&rho * &sc_h4);
+        acc_g1 = &acc_g1 + &(&rho * &sc_g1);
+
+        let dyn_pts = batch_normalize(&[
+            proof.a_prime, pp.c_total, proof.k_prime, proof.c_bp, proof.a_bar,
+            proof.t_total, proof.t_scale_t, proof.t_refund, proof.t_scale_r,
+            proof.t_bp, proof.t_scale_bp, proof.t_bbs,
+        ]);
+        for (sc, pt) in [
+            (sc_aprime,    dyn_pts[0]),
+            (sc_ctotal,    dyn_pts[1]),
+            (sc_kprime,    dyn_pts[2]),
+            (sc_cbp,       dyn_pts[3]),
+            (sc_abar,      dyn_pts[4]),
+            (sc_ttotal,    dyn_pts[5]),
+            (sc_tscale_t,  dyn_pts[6]),
+            (sc_trefund,   dyn_pts[7]),
+            (sc_tscale_r,  dyn_pts[8]),
+            (sc_tbp,       dyn_pts[9]),
+            (sc_tscale_bp, dyn_pts[10]),
+            (sc_tbbs,      dyn_pts[11]),
+        ] {
+            dyn_bases.push(pt);
+            dyn_scalars.push(&rho * &sc);
+        }
+    }
+
+    let mut msm_bases:   Vec<G1Affine>  = Vec::with_capacity(5 + dyn_bases.len());
+    let mut msm_scalars: Vec<BlsScalar> = Vec::with_capacity(5 + dyn_scalars.len());
+    msm_bases.extend_from_slice(&[
+        generators.h_affine[0], generators.h_affine[1],
+        generators.h_affine[2], generators.h_affine[4],
+        generators.g1_affine,
+    ]);
+    msm_scalars.extend_from_slice(&[acc_h0, acc_h1, acc_h2, acc_h4, acc_g1]);
+    msm_bases.extend_from_slice(&dyn_bases);
+    msm_scalars.extend_from_slice(&dyn_scalars);
+
+    let combined = g1_msm(&msm_bases, &msm_scalars);
+    if !bool::from(combined.is_identity()) {
+        return Err(ActError::VerificationFailed("Batched Schnorr check failed".into()));
+    }
+
+    // ── Step 4: Batched pairing check ────────────────────────────────────────
+    let a_prime_aff: Vec<G1Affine>    = proofs.iter().map(|p| G1Affine::from(p.a_prime)).collect();
+    let a_bar_neg_aff: Vec<G1Affine>  = proofs.iter().map(|p| G1Affine::from(-p.a_bar)).collect();
+    let a_prime_agg = g1_msm(&a_prime_aff,   &rhos);
+    let a_bar_agg   = g1_msm(&a_bar_neg_aff, &rhos);
+    let pairing_result = Bls12::multi_miller_loop(&[
+        (&G1Affine::from(a_prime_agg), &keys.pk_daily_prepared),
+        (&G1Affine::from(a_bar_agg),   &generators.g2_prepared),
+    ])
+    .final_exponentiation();
+    if pairing_result != Gt::identity() {
+        return Err(ActError::VerificationFailed("Batched pairing check failed".into()));
+    }
+
+    // ── Step 5: Verify all BEQ proofs concurrently ───────────────────────────
+    let beq_check_results: Vec<Result<()>> = proofs
+        .par_iter()
+        .zip(nonces.par_iter())
+        .zip(per_proof.par_iter())
+        .map(|((proof, nonce), pp)| {
+            let mut beq_ctx = Vec::new();
+            beq_ctx.extend_from_slice(&h_ctx.to_bytes());
+            beq_ctx.extend_from_slice(&proof.s.to_le_bytes());
+            beq_ctx.extend_from_slice(&proof.k_cur.to_bytes());
+            beq_ctx.extend_from_slice(&proof.t_issue.to_le_bytes());
+            beq_ctx.extend_from_slice(nonce);
+            let beq_commitments = [
+                G1Affine::from(proof.a_prime),
+                G1Affine::from(proof.a_bar),
+                G1Affine::from(proof.t_bbs),
+                G1Affine::from(proof.k_prime),
+                G1Affine::from(pp.c_total),
+            ];
+            verify_batched_equality(
+                &proof.batched_eq, proof.c_bp,
+                generators.h[4], generators.h[0],
+                &beq_ctx, &beq_commitments,
+            )
+        })
+        .collect();
+    for r in beq_check_results {
+        r?;
+    }
+
+    // ── Step 6: Issue refund responses individually ───────────────────────────
+    let mut responses = Vec::with_capacity(n);
+    for proof in proofs {
+        let e_refund       = Scalar::rand(rng);
+        let s_prime_refund = Scalar::rand(rng);
+        let k_prime_aff    = G1Affine::from(proof.k_prime);
+        let msg_part = g1_msm(
+            &[generators.g1_affine, k_prime_aff, generators.h_affine[0]],
+            &[BlsScalar::ONE, BlsScalar::ONE, s_prime_refund.0],
+        );
+        let denom = e_refund + keys.sk_daily;
+        if denom.is_zero() {
+            return Err(ActError::ProtocolError("Division by zero in issuance".into()));
+        }
+        let a_refund = &msg_part * &denom.inverse().0;
+        responses.push(SpendResponse { a_refund, e_refund, s_prime_refund });
+    }
+
+    Ok(responses)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -511,6 +757,112 @@ mod tests {
         ).unwrap();
         assert!(verify_spend(
             &proof, 42, &[0xBBu8; 16], &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+        ).is_err());
+    }
+
+    #[test]
+    fn batch_spend_empty() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let responses = verify_spend_batch(
+            &[], 42, &[], &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+        ).unwrap();
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn batch_spend_single() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let k_cur = Scalar::rand_nonzero(&mut rng);
+        let t_issue = 42u32;
+        let token = daily_sig(&mut rng, k_cur, 100, t_issue, &generators, &keys);
+        let nonce = [0xAAu8; 16];
+        let (_client, proof) = SpendProver::prove(
+            &mut rng, &token, k_cur, 100, t_issue, 30, &nonce,
+            &generators, &keys.pk_daily, h_ctx,
+        ).unwrap();
+        let responses = verify_spend_batch(
+            &[proof], t_issue, &[nonce], &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+        ).unwrap();
+        assert_eq!(responses.len(), 1);
+        assert!(!bool::from(responses[0].a_refund.is_identity()));
+    }
+
+    #[test]
+    fn batch_spend_multiple() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let t_issue = 42u32;
+
+        const BATCH: usize = 4;
+        let mut proofs = Vec::with_capacity(BATCH);
+        let mut nonces: Vec<[u8; 16]> = Vec::with_capacity(BATCH);
+        for i in 0..BATCH {
+            let k_cur = Scalar::rand_nonzero(&mut rng);
+            let token = daily_sig(&mut rng, k_cur, 100, t_issue, &generators, &keys);
+            let mut nonce = [0u8; 16];
+            nonce[0] = i as u8;
+            let (_client, proof) = SpendProver::prove(
+                &mut rng, &token, k_cur, 100, t_issue, 20, &nonce,
+                &generators, &keys.pk_daily, h_ctx,
+            ).unwrap();
+            proofs.push(proof);
+            nonces.push(nonce);
+        }
+
+        let responses = verify_spend_batch(
+            &proofs, t_issue, &nonces, &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+        ).unwrap();
+        assert_eq!(responses.len(), BATCH);
+        for r in &responses {
+            assert!(!bool::from(r.a_refund.is_identity()));
+        }
+    }
+
+    #[test]
+    fn batch_spend_rejects_bad_proof() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let keys2 = ServerKeys::generate(&mut rng);
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let t_issue = 42u32;
+
+        let mut proofs = Vec::new();
+        let mut nonces: Vec<[u8; 16]> = Vec::new();
+        for i in 0..3usize {
+            let k_cur = Scalar::rand_nonzero(&mut rng);
+            let token = daily_sig(&mut rng, k_cur, 100, t_issue, &generators, &keys);
+            let mut nonce = [0u8; 16];
+            nonce[0] = i as u8;
+            let (_client, proof) = SpendProver::prove(
+                &mut rng, &token, k_cur, 100, t_issue, 20, &nonce,
+                &generators, &keys.pk_daily, h_ctx,
+            ).unwrap();
+            proofs.push(proof);
+            nonces.push(nonce);
+        }
+        // Add a proof from different keys → batch must fail.
+        {
+            let k_cur = Scalar::rand_nonzero(&mut rng);
+            let token = daily_sig(&mut rng, k_cur, 100, t_issue, &generators, &keys2);
+            let nonce = [0xFFu8; 16];
+            let (_client, bad_proof) = SpendProver::prove(
+                &mut rng, &token, k_cur, 100, t_issue, 20, &nonce,
+                &generators, &keys2.pk_daily, h_ctx,
+            ).unwrap();
+            proofs.push(bad_proof);
+            nonces.push(nonce);
+        }
+        assert!(verify_spend_batch(
+            &proofs, t_issue, &nonces, &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
         ).is_err());
     }
 }
