@@ -352,14 +352,23 @@ pub fn verify_batched_equality(
     }
 
     // ── 2. Read scalar responses ──────────────────────────────────────────────
+    // z_e < q_25519 < r (checked above), so it is already canonical.
     let z_m_bls   = scalar_from_le_bytes_mod_order(&proof.z_e_bytes);
     let z_m_25519 = DalekScalar::from_bytes_mod_order(proof.z_e_bytes);
-    let z_r_bls   = scalar_from_le_bytes_mod_order(&proof.z_r_bls_bytes);
+    // z_r_bls is a BLS12-381 scalar response and MUST be canonical (< r).
+    // Accepting non-canonical encodings would allow proof malleability: a valid
+    // proof could be re-encoded as (z_r + k·r) for any k, producing a distinct
+    // byte string that still verifies.  Reject such inputs explicitly.
+    let z_r_bls = Option::<BlsScalar>::from(BlsScalar::from_bytes_le(&proof.z_r_bls_bytes))
+        .ok_or_else(|| ActError::VerificationFailed(
+            "BatchedEqualityProof: z_r_bls is not a canonical BLS12-381 scalar".into(),
+        ))?;
     let z_r_25519 = DalekScalar::from_bytes_mod_order(proof.z_r_25519_bytes);
 
     // ── 3. Read stored challenge ──────────────────────────────────────────────
     let c128 = proof.c_bytes;
     let c_32 = c128_to_bytes32(&c128);
+    // The challenge is 128-bit padded to 32 bytes, so it is always canonical.
     let c_fr = scalar_from_le_bytes_mod_order(&c_32);
     let c_dalek = DalekScalar::from_bytes_mod_order(c_32);
 
@@ -494,6 +503,23 @@ mod tests {
         let (proof, c_bls) = prove_batched_equality(&mut rng, 20, r_bls, h4, h0, b"ctx", &[comm]).unwrap();
         // Verifying with a different commitment slice must fail.
         assert!(verify_batched_equality(&proof, c_bls, h4, h0, b"ctx", &[]).is_err());
+    }
+
+    /// A proof with a non-canonical z_r_bls (value ≥ r) must be rejected.
+    /// Accepting it would allow proof malleability: any valid (z_r) can be
+    /// re-encoded as (z_r + k·r) and the verifier would still accept it.
+    #[test]
+    fn non_canonical_z_r_bls_rejected() {
+        let mut rng = thread_rng();
+        let (h4, h0) = gens_h4_h0();
+        let r_bls = BlsScalar::random(&mut rng);
+        let (mut proof, c_bls) = prove_batched_equality(&mut rng, 5, r_bls, h4, h0, b"ctx", &[]).unwrap();
+        // Overwrite z_r_bls_bytes with all 0xFF — a value well above the field order r.
+        proof.z_r_bls_bytes = [0xFFu8; 32];
+        assert!(
+            verify_batched_equality(&proof, c_bls, h4, h0, b"ctx", &[]).is_err(),
+            "verifier must reject non-canonical z_r_bls"
+        );
     }
 
     #[test]
