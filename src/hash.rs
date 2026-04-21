@@ -263,3 +263,15 @@ mod tests {
         assert_eq!(s, s2);
     }
 }
+
+
+#[cfg(test)]
+mod _api_check {
+    use super::*;
+    use ff::FromUniformBytes;
+    #[test]
+    fn from_uniform_bytes_compiles() {
+        let wide = [0u8; 64];
+        let _s = BlsScalar::from_uniform_bytes(&wide);
+    }
+}
