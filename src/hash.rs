@@ -1,9 +1,9 @@
-//! Domain-separated hashing utilities backed by blstrs and SHA-256.
+//! Domain-separated hashing utilities backed by blstrs and SHA-256/SHA-512.
 
 extern crate alloc;
 use blstrs::{G1Affine, G1Projective, G2Affine, G2Projective, Scalar as BlsScalar};
 use group::Group;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use std::io::Write as _;
 
 use crate::setup::Generators;
@@ -190,9 +190,60 @@ pub(crate) fn write_scalar(w: &mut impl std::io::Write, s: Scalar) {
 
 // ---- Internal helpers -------------------------------------------------------
 
-/// Convert a 32-byte SHA-256 digest to a scalar by reducing modulo the group order.
+/// `K = 2^256 mod r` (little-endian), precomputed.
+///
+/// Used by `scalar_from_hash` to implement the "two-half" wide reduction:
+///
+///   result = (lo + hi · 2^256) mod r
+///          = (lo mod r + (hi mod r) · K) mod r
+///
+/// where `lo` and `hi` are the lower and upper 256-bit halves of the 512-bit
+/// SHA-512 digest.  Since SHA-512 maps to a (pseudo-)uniform 512-bit value,
+/// the output distribution has statistical distance ≤ r / 2^512 ≈ 2^−257 from
+/// uniform, compared with ≈ 2^−1 for the naive 256-bit repeated-subtraction.
+///
+/// Derivation: r ≈ 2^254.86, so floor(2^256 / r) = 2 and
+///   K = 2^256 − 2r = 0x1824b159_acc5056f_998c4fef_ecbc4ff5_5884b7fa_00034802_00000001_fffffffe
+const K_2_256_MOD_R: [u8; 32] = [
+    // limb 0 (least-significant 64 bits) = 0x00000001_fffffffe
+    0xfe, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00,
+    // limb 1 = 0x5884b7fa_00034802
+    0x02, 0x48, 0x03, 0x00, 0xfa, 0xb7, 0x84, 0x58,
+    // limb 2 = 0x998c4fef_ecbc4ff5
+    0xf5, 0x4f, 0xbc, 0xec, 0xef, 0x4f, 0x8c, 0x99,
+    // limb 3 (most-significant 64 bits) = 0x1824b159_acc5056f
+    0x6f, 0x05, 0xc5, 0xac, 0x59, 0xb1, 0x24, 0x18,
+];
+
+/// Convert a 32-byte SHA-256 digest to a scalar using a bias-free wide reduction.
+///
+/// The 32-byte digest is expanded to 64 bytes via SHA-512, then the two 256-bit
+/// halves are combined as `(lo + hi · 2^256) mod r`.  This matches the
+/// hash-to-field strategy of RFC 9380 §5.2 and eliminates the per-value bias
+/// that arises from naive repeated subtraction on a 256-bit digest.
 fn scalar_from_hash(digest: &[u8; 32]) -> Scalar {
-    Scalar(scalar_from_le_bytes_mod_order(digest))
+    // Expand to 64 bytes.  Treating SHA-512 as a random oracle, the output is
+    // indistinguishable from a uniform 512-bit value.
+    let wide_out = Sha512::digest(digest.as_slice());
+    let wide_bytes: [u8; 64] = {
+        let s: &[u8] = &wide_out[..];
+        s.try_into().expect("SHA-512 output is always 64 bytes")
+    };
+
+    let lo: &[u8; 32] = wide_bytes[..32].try_into()
+        .expect("lower 32 bytes of 64-byte array always fits");
+    let hi: &[u8; 32] = wide_bytes[32..].try_into()
+        .expect("upper 32 bytes of 64-byte array always fits");
+
+    let s_lo = scalar_from_le_bytes_mod_order(lo);
+    let s_hi = scalar_from_le_bytes_mod_order(hi);
+
+    // K = 2^256 mod r; guaranteed < r so from_bytes_le succeeds.
+    let k = Option::<BlsScalar>::from(BlsScalar::from_bytes_le(&K_2_256_MOD_R))
+        .expect("K_2_256_MOD_R is a valid canonical BLS12-381 scalar");
+
+    // Combine: (lo + hi · K) mod r  ≡  (lo + hi · 2^256) mod r
+    Scalar(&s_lo + &(&s_hi * &k))
 }
 
 impl Scalar {
@@ -261,5 +312,35 @@ mod tests {
         let back = s.to_bytes_le();
         let s2 = BlsScalar::from_bytes_le(&back).unwrap();
         assert_eq!(s, s2);
+    }
+
+    /// Verify the precomputed constant K = 2^256 mod r.
+    ///
+    /// We compute 2^256 mod r via repeated squaring and compare with K_2_256_MOD_R.
+    #[test]
+    fn k_2_256_mod_r_constant_is_correct() {
+        // 2^256 mod r via iterated squaring in the scalar field.
+        let two = BlsScalar::from(2u64);
+        let mut pow = BlsScalar::from(1u64);
+        for _ in 0..256 {
+            pow = &pow * &two;
+        }
+        let k = Option::<BlsScalar>::from(BlsScalar::from_bytes_le(&K_2_256_MOD_R))
+            .expect("K constant must be a valid scalar");
+        assert_eq!(pow, k, "K_2_256_MOD_R does not equal 2^256 mod r");
+    }
+
+    /// Verify that scalar_from_hash produces a uniform-looking distribution:
+    /// two different inputs must yield different outputs and both be canonical.
+    #[test]
+    fn scalar_from_hash_differs_on_distinct_inputs() {
+        let d1 = [0x01u8; 32];
+        let d2 = [0x02u8; 32];
+        let s1 = scalar_from_hash(&d1);
+        let s2 = scalar_from_hash(&d2);
+        assert_ne!(s1, s2);
+        // Both must be canonical (round-trip via bytes).
+        assert_eq!(Scalar::from_bytes(&s1.to_bytes()).unwrap(), s1);
+        assert_eq!(Scalar::from_bytes(&s2.to_bytes()).unwrap(), s2);
     }
 }

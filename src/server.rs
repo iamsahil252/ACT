@@ -42,6 +42,15 @@ pub struct ServerConfig {
     pub current_epoch: u32,
     /// Grace period in seconds after epoch rollover during which the previous
     /// epoch's spend nullifiers are still accepted.
+    ///
+    /// # Security note – burst capacity
+    ///
+    /// During the grace window a subscriber holds both a valid epoch-T token
+    /// **and** a fresh epoch-T+1 token, so they can submit up to `2 × c_max`
+    /// spend operations in this interval.  Deployments that require strict
+    /// per-epoch rate limiting **must** set this field to `0`.  Alternatively,
+    /// implement cumulative epoch tracking (summing spend nullifiers across both
+    /// epochs per subscription key) before accepting any grace-period spend.
     pub epoch_grace_period_secs: u64,
     /// TTL for idempotency cache entries (seconds).
     pub idempotency_ttl_secs: u64,
