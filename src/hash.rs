@@ -203,7 +203,7 @@ pub(crate) fn write_scalar(w: &mut impl std::io::Write, s: Scalar) {
 /// uniform, compared with ≈ 2^−1 for the naive 256-bit repeated-subtraction.
 ///
 /// Derivation: r ≈ 2^254.86, so floor(2^256 / r) = 2 and
-///   K = 2^256 − 2r = 0x1824b159acc5056f_998c4fefecbc4ff5_5884b7fa00034802_00000001fffffffe
+///   K = 2^256 − 2r = 0x1824b159_acc5056f_998c4fef_ecbc4ff5_5884b7fa_00034802_00000001_fffffffe
 const K_2_256_MOD_R: [u8; 32] = [
     // limb 0 (least-significant 64 bits) = 0x00000001_fffffffe
     0xfe, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00,
@@ -230,8 +230,10 @@ fn scalar_from_hash(digest: &[u8; 32]) -> Scalar {
         s.try_into().expect("SHA-512 output is always 64 bytes")
     };
 
-    let lo: &[u8; 32] = wide_bytes[..32].try_into().unwrap();
-    let hi: &[u8; 32] = wide_bytes[32..].try_into().unwrap();
+    let lo: &[u8; 32] = wide_bytes[..32].try_into()
+        .expect("lower 32 bytes of 64-byte array always fits");
+    let hi: &[u8; 32] = wide_bytes[32..].try_into()
+        .expect("upper 32 bytes of 64-byte array always fits");
 
     let s_lo = scalar_from_le_bytes_mod_order(lo);
     let s_hi = scalar_from_le_bytes_mod_order(hi);
