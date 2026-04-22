@@ -281,6 +281,7 @@ The advantage $\advantage{RLS}(\mathcal{A}) = \Pr[\mathcal{A} \text{ wins}]$. An
 In this section we present a concrete instantiation of EBUT using blind BBS+ signatures, Pedersen commitments, and zero-knowledge proofs. The construction relies on a bilinear group setting (Type-3 pairing) and the random oracle model.
 
 \subsection{Public Parameters and Key Generation}
+\label{sec:keygen}
 
 Let $\mathbb{G}_1, \mathbb{G}_2, \mathbb{G}_T$ be groups of prime order $q$ with a pairing $e: \mathbb{G}_1 \times \mathbb{G}_2 \to \mathbb{G}_T$. Let $g_1 \in \mathbb{G}_1$ and $g_2 \in \mathbb{G}_2$ be fixed generators.
 
@@ -508,7 +509,7 @@ The server supplies an application-level required amount $s_{\mathsf{req}} \in [
   \[
   \eta \xleftarrow{\$} \{0,1\}^{128}.
   \]
-  No network request to the server is needed.  The nonce $\eta$ is bound into the Fiat--Shamir challenge and serves as a replay-prevention token; the server checks $\eta \notin \mathcal{N}_{\mathsf{spent}}$ (read-only) and atomically marks it spent upon success.  By the birthday paradox, the probability of an honest client generating a colliding $\eta$ within a single epoch is at most $q_S^2/2^{128}$, which is negligible for any polynomial number of spends $q_S$.
+  No network request to the server is needed.  The nonce $\eta$ is bound into the Fiat--Shamir challenge and serves as a replay-prevention token.  The server checks $\eta \notin \mathcal{N}_{\mathsf{spent}}$ as a read-only check before proof verification, then atomically marks $\eta$ as spent only after all cryptographic checks pass.  By the birthday paradox, the probability of an honest client generating a colliding $\eta$ within a single epoch is at most $q_S^2/2^{128}$, which is negligible for any polynomial number of spends $q_S$.
 \item \textbf{Refund commitment.}
   Let $m = c_{\mathsf{bal}} - s$. Choose a fresh secret $k^* \xleftarrow{\$} \mathbb{Z}_q^*$ and randomness $r^* \xleftarrow{\$} \mathbb{Z}_q$. Compute the commitment for the new token:
   \[
@@ -990,7 +991,7 @@ We proceed via a sequence of games $\mathsf{H}_0,\dots,\mathsf{H}_4$. Let $\Pr[S
 \]
 
 \paragraph{Game $\mathsf{H}_2$ (Simulator Trapdoor \& Nullifier Randomization):}
-In this game the adversary $\mathcal{A}$ (acting as a malicious server) outputs an arbitrary public key $\mathsf{pk}_S$ together with a valid proof $\pi_S = (T_y, z_y)$ as required by the extended $\mathsf{Server.KeyGen}$ (Section~4.1).
+In this game the adversary $\mathcal{A}$ (acting as a malicious server) outputs an arbitrary public key $\mathsf{pk}_S$ together with a valid proof $\pi_S = (T_y, z_y)$ as required by the extended $\mathsf{Server.KeyGen}$ (Section~\ref{sec:keygen}).
 
 Because $\pi_S$ is a Fiat--Shamir compiled Schnorr proof in the Random Oracle Model, the Simulator $\mathcal{C}$ applies the standard rewindable extractor on $\mathcal{H}_{\mathsf{scalar}}$ to extract the underlying secret key $y$ satisfying $\mathsf{pk}_S = g_2^y$.  If extraction fails (with probability bounded by the knowledge-soundness error of the Schnorr protocol), $\mathcal{C}$ aborts.
 
@@ -1145,6 +1146,8 @@ Implementers must transmit the public statements alongside the proof. We provide
 \end{verbatim}
 
 \subsubsection{Spend Request Payload}
+The \texttt{eta} field carries the 128-bit session nonce generated locally by the client via CSPRNG (Section~\ref{sec:spend-exact}, step~1). It is encoded as 16 bytes in hexadecimal.
+
 Exact mode:
 \begin{verbatim}
 {
@@ -1153,7 +1156,7 @@ Exact mode:
   "s_req": <32-bit unsigned integer>,
   "T_issue": <32-bit unsigned integer>,
   "k_cur": <32-byte scalar, hex>,
-  "eta": <16-byte locally generated nonce, hex>,
+  "eta": <16-byte nonce, hex>,
   "K_prime": <48-byte compressed G1 point, hex>,
   "C_BP": <48-byte compressed G1 point, hex>,
   "pi_spend": {
@@ -1184,7 +1187,7 @@ Hidden mode:
   "mode": "Hidden",
   "T_issue": <32-bit unsigned integer>,
   "k_cur": <32-byte scalar, hex>,
-  "eta": <16-byte locally generated nonce, hex>,
+  "eta": <16-byte nonce, hex>,
   "K_prime": <48-byte compressed G1 point, hex>,
   "C_BP": <48-byte compressed G1 point, hex>,
   "C_s": <48-byte compressed G1 point, hex>,
