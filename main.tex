@@ -377,7 +377,7 @@ At the beginning of epoch $T \le E_{\mathsf{max}}$, the client derives an epoch-
   Because $k_{\mathsf{sub}}$ has min-entropy $\ge 250$ bits (DL is hard given $X = g_1^{k_{\mathsf{sub}}}$), and $\mathcal{H}_{\mathsf{scalar}}$ is modelled as a Random Oracle, the outputs $k_{\mathsf{daily}}$ and $r_{\mathsf{daily}}$ are computationally indistinguishable from uniform in $\mathbb{Z}_q$ to any PPT adversary.  The Pedersen commitment $K_{\mathsf{daily}}$ therefore retains perfect hiding.
 
   \textbf{Liveness guarantee.}
-  If the client crashes after the server burns $N_T$ in $\DB_{\mathsf{epoch}}$ but before the response arrives, the client need only query the current OS epoch $T$, re-evaluate the two PRF outputs locally from the persisted $k_{\mathsf{sub}}$, and reconstruct the identical $k_{\mathsf{daily}}$, $r_{\mathsf{daily}}$, and $\pi_{\mathsf{refresh}}$.  The server's idempotency cache matches the resubmitted proof hash and returns the cached blind signature, which the client unblinds correctly.  No synchronous disk write of ephemeral randomness is required.
+  If the client crashes after the server burns $N_T$ in $\DB_{\mathsf{epoch}}$ but before the response arrives, the client need only re-evaluate $N_T = k_{\mathsf{sub}} \cdot H_T$ from the persisted $k_{\mathsf{sub}}$ and the public epoch $T$.  The server's idempotency cache (keyed on $N_T$; see Section~\ref{sec:idempotency}) returns the cached blind signature, which the client unblinds correctly.  No synchronous disk write of ephemeral randomness is required; the client may re-derive $k_{\mathsf{daily}}$ and $r_{\mathsf{daily}}$ fresh.
 
 \item \textbf{Expiry range proof (Cross-Curve BEQ).}
   Compute $\Delta = E_{\mathsf{max}} - T$.
@@ -447,9 +447,9 @@ The server performs the following checks in order:
 \begin{enumerate}[leftmargin=*]
 \item \textbf{Idempotency cache check (FIRST):} Compute
   \[
-  \mathtt{key}_{\mathsf{ref}} = \mathcal{H}_{\mathsf{scalar}}\!\bigl(\text{EBUT:Idempotency:Refresh} \parallel \mathsf{len}(\pi_{\mathsf{refresh}}) \parallel \pi_{\mathsf{refresh}}\bigr).
+  \mathtt{key}_{\mathsf{ref}} = \mathcal{H}_{\mathsf{scalar}}\!\bigl(\text{EBUT:Idempotency:Refresh} \parallel N_T\bigr).
   \]
-  If $\mathtt{key}_{\mathsf{ref}}$ is present in the idempotency cache, return the cached $(A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$ immediately \textbf{without} re-executing the expensive verification or touching $\DB_{\mathsf{epoch}}$.
+  The key is derived exclusively from $N_T$ (the epoch nullifier), which is uniquely determined by the client's master secret $k_{\mathsf{sub}}$ and the public epoch $T$ via $N_T = k_{\mathsf{sub}} \cdot H_T$.  An honest client reconstructing the same $N_T$ deterministically will always hit the same cache slot.  \textbf{Critically, the key must not be derived from $\pi_{\mathsf{refresh}}$ or $K_{\mathsf{daily}}$ alone}: those values depend on the optional blinding randomness $r_{\mathsf{daily}}$, which an adversarial client may vary across retries while presenting the same epoch nullifier, enabling a double-mint if a cache miss follows a partial write (see Section~\ref{sec:idempotency}).  If $\mathtt{key}_{\mathsf{ref}}$ is present in the idempotency cache, return the cached $(A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$ immediately \textbf{without} re-executing the expensive verification or touching $\DB_{\mathsf{epoch}}$.
 \item \textbf{Epoch check:} $T$ must equal the current epoch (or be within a small grace window).
 \item \textbf{Nullifier freshness check (read-only):} $N_T \notin \DB_{\mathsf{epoch}}$ and $N_T \neq 1_{\mathbb{G}_1}$. \textbf{Do not insert $N_T$ at this step.} Inserting before all proofs are verified creates a TOCTOU vulnerability: an adversary can submit a valid $N_T$ with garbage ZK proofs; the server would prematurely burn the epoch nullifier and then abort during proof verification, permanently locking the legitimate user out for the entire epoch. All state mutations are deferred to the atomic step~11.
 \item \textbf{Basic bounds:} $A' \neq 1_{\mathbb{G}_1}$ and $T_{\mathsf{BBS}} \neq 1_{\mathbb{G}_1}$.
@@ -470,7 +470,7 @@ The server performs the following checks in order:
   \[
   e(A', \mathsf{pk}_S) \stackrel{?}{=} e(\bar{A}, g_2).
   \]
-\item \textbf{Atomic state mutation (step 11, LAST):} Only after all checks in steps~1--10 pass: first write $\mathtt{key}_{\mathsf{ref}} \mapsto (A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$ to the idempotency cache, then atomically insert $N_T$ into $\DB_{\mathsf{epoch}}$ (reject if already present, indicating a concurrent duplicate or replay). \textbf{The idempotency cache entry must be persisted before the $\DB_{\mathsf{epoch}}$ insertion.} If the server crashes between these two writes and the client retries with the same $\pi_{\mathsf{refresh}}$, the retry will hit the idempotency cache and receive the correct response without touching $\DB_{\mathsf{epoch}}$. If both writes are to separate storage systems, they must be wrapped in a single distributed transaction or the cache must be written first; writing to $\DB_{\mathsf{epoch}}$ first voids the idempotency guarantee and will permanently lock out a client whose network dropped between the two writes.
+\item \textbf{Atomic state mutation (step 11, LAST):} Only after all checks in steps~1--10 pass: first write $\mathtt{key}_{\mathsf{ref}} \mapsto (A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$ to the idempotency cache (where $\mathtt{key}_{\mathsf{ref}} = \mathcal{H}_{\mathsf{scalar}}(\text{EBUT:Idempotency:Refresh} \parallel N_T)$), then atomically insert $N_T$ into $\DB_{\mathsf{epoch}}$ (reject if already present, indicating a concurrent duplicate or replay). \textbf{The idempotency cache entry must be persisted before the $\DB_{\mathsf{epoch}}$ insertion.} Because the cache key is derived from $N_T$, any retry that presents the same epoch nullifier---regardless of whether $K_{\mathsf{daily}}$ or $r_{\mathsf{daily}}$ was regenerated---will hit the existing cache entry and receive the original response, rather than bypassing it and triggering a second mint.  If both writes are to separate storage systems, they must be wrapped in a single distributed transaction or the cache must be written first; writing to $\DB_{\mathsf{epoch}}$ first voids the idempotency guarantee and will permanently lock out a client whose network dropped between the two writes.
 \end{enumerate}
 
 If all checks pass, the server issues a daily token by choosing $e_{\mathsf{daily}}, s'_{\mathsf{daily}} \xleftarrow{\$} \mathbb{Z}_q$ and computing
@@ -646,12 +646,17 @@ and forms the remaining-balance commitment
 \[
 C_{\mathsf{BP}} = m \cdot h_4 + r_{\mathsf{BP}} \cdot h_0.
 \]
-It then generates two BEQ proofs:
+To prove $s \ge 1$ without disclosing $s$, the client computes an auxiliary commitment to $s - 1$:
+\[
+C_{s-1} = (s - 1) \cdot h_5 + r_{s-1} \cdot h_0, \quad r_{s-1} \xleftarrow{\$} \mathbb{Z}_{q_{\text{BLS}}}.
+\]
+It then generates three BEQ proofs:
 \begin{itemize}[leftmargin=*]
-\item $\pi_{\text{BEQ\_spend}}$ for the refund balance $m$ using BLS generator $h_4$; and
-\item $\pi_{\text{BEQ\_s}}$ for the hidden spend amount $s$ using BLS generator $h_5$.
+\item $\pi_{\text{BEQ\_spend}}$ for the refund balance $m$ using BLS generator $h_4$;
+\item $\pi_{\text{BEQ\_s}}$ for the hidden spend amount $s$ using BLS generator $h_5$; and
+\item $\pi_{\text{BEQ\_s\_minus\_1}}$ for the auxiliary value $s-1$ using BLS generator $h_5$ and commitment $C_{s-1}$.
 \end{itemize}
-The request discloses $(\mathsf{mode}=\text{``Hidden''}, k_{\mathsf{cur}}, T_{\mathsf{issue}}, \eta, K', C_{\mathsf{BP}}, C_s)$ and does \emph{not} disclose $s$ or $s_{\mathsf{req}}$.
+The request discloses $(\mathsf{mode}=\text{``Hidden''}, k_{\mathsf{cur}}, T_{\mathsf{issue}}, \eta, K', C_{\mathsf{BP}}, C_s, C_{s-1})$ and does \emph{not} disclose $s$ or $s_{\mathsf{req}}$.
 
 \paragraph{Zero-Knowledge Proof $\pi_{\mathsf{spend}}$ (Hidden Mode).}
 Hidden mode extends the Exact-mode witness set with the scaled hidden amount $\widetilde{a} = s r_1$ and the scaled commitment blinder $x = r_s r_1$. Let $\rho_{\widetilde{a}}, \rho_x \xleftarrow{\$} \mathbb{Z}_q$ be the corresponding blinders and define $\rho_m = \rho_{\tilde{c}} - \rho_{\widetilde{a}}$. The prover computes
@@ -683,8 +688,8 @@ On the wire, $z_{\widetilde{a}}$ is serialized as the field
 \paragraph{Server Verification (Hidden Mode).}
 The server performs the same nonce, double-spend, BBS+, BEQ-for-$m$, and pairing checks as in Exact mode, but with the following mode-specific requirements:
 \begin{enumerate}[leftmargin=*]
-\item Require $\mathsf{mode} = \text{``Hidden''}$; require $(C_s, \pi_{\text{BEQ\_s}})$ to be present; and reject any disclosed Exact-mode-only fields $(s, s_{\mathsf{req}}, T_{\mathsf{scale},T}, T_{\mathsf{total}})$.
-\item Compute the spend idempotency key over the Hidden-mode statement, binding $\text{``Hidden''}$, $C_s$, $\pi_{\text{BEQ\_s}}$, $\pi_{\mathsf{spend}}$, and $\eta$.
+\item Require $\mathsf{mode} = \text{``Hidden''}$; require $(C_s, C_{s-1}, \pi_{\text{BEQ\_s}}, \pi_{\text{BEQ\_s\_minus\_1}})$ to be present; and reject any disclosed Exact-mode-only fields $(s, s_{\mathsf{req}}, T_{\mathsf{scale},T}, T_{\mathsf{total}})$.
+\item Compute the spend idempotency key over the Hidden-mode statement, binding $\text{``Hidden''}$, $C_s$, $C_{s-1}$, $\pi_{\text{BEQ\_s}}$, $\pi_{\text{BEQ\_s\_minus\_1}}$, $\pi_{\mathsf{spend}}$, and $\eta$.
 \item Recompute the Fiat--Shamir challenge over the Hidden-mode transcript above.
 \item Verify the hidden-amount bridge:
   \[
@@ -695,7 +700,12 @@ The server performs the same nonce, double-spend, BBS+, BEQ-for-$m$, and pairing
     z_m \cdot h_4 + z_u \cdot h_1 + z_{r_1} \cdot T_{\mathsf{issue}} \cdot h_2 + z_v \cdot h_0 - T_{\mathsf{refund}} &\stackrel{?}{=} z_{r_1} \cdot K' - T_{\mathsf{scale},R}, \\
     z_m \cdot h_4 + z_w \cdot h_0 - T_{\mathsf{BP}} &\stackrel{?}{=} z_{r_1} \cdot C_{\mathsf{BP}} - T_{\mathsf{scale},BP}.
   \end{align*}
-\item Verify $\pi_{\text{BEQ\_s}}$ with respect to $C_s$ and reject $s=0$ via the proof statement (e.g., an explicit non-zero check or a range on $s-1$).
+\item Verify $\pi_{\text{BEQ\_s}}$ with respect to $C_s$.  Then enforce $s \ge 1$ via the following two-step check:
+  \begin{enumerate}[(a)]
+  \item Verify the public commitment relation $C_s = C_{s-1} + h_5$; this publicly proves $s = (s-1)+1$ under the Pedersen binding property.
+  \item Verify $\pi_{\text{BEQ\_s\_minus\_1}}$ with respect to $C_{s-1}$; this proves $s-1 \in [0, 2^{32}-1]$, hence $s \in [1, 2^{32}]$.  Combined with the upper-bound check from $\pi_{\text{BEQ\_s}}$ (which proves $s \in [0, 2^{32}-1]$), we obtain $s \in [1, 2^{32}-1]$.
+  \end{enumerate}
+  \textbf{Reject any request that omits $C_{s-1}$ or $\pi_{\text{BEQ\_s\_minus\_1}}$, or for which $C_s \neq C_{s-1} + h_5$.}  Without this check, a malicious client can spend $s=0$ credits, burning no balance, enabling unlimited free requests and potential denial-of-service or state-probing attacks.
 \end{enumerate}
 If all checks pass, the server issues the same refund token format as in Exact mode and the client finalizes identically. Hidden mode therefore changes only the statement being proved, not the resulting refund credential.
 
@@ -812,7 +822,8 @@ and that $m \in [0, 2^{32}-1]$.
 
 \begin{enumerate}[leftmargin=*]
 \item \textbf{Bound Check:}
-  Verify that $0 \le z \le 2^{240}-1$ (as an integer). If not, reject. This tighter bound (compared to checking only $z < q_{25519}$, where $q_{25519} \approx 2^{252}$) is enforced by the prover's rejection-sampling step and is required for the zero-knowledge guarantee: without it, a large $z > 2^{240}-1$ would reveal that $c \cdot m$ is large, leaking a lower bound on the secret $m$.
+  \textbf{Deserialize $z$ as a raw unsigned big-endian integer occupying exactly 31 bytes; do not pass it to any curve-scalar deserialization routine.}  Many elliptic-curve libraries (e.g., Dalek's \texttt{Scalar::from\_bytes\_mod\_order}, blstrs' scalar deserializer) silently reduce their input modulo the group order on deserialization.  Calling such a routine on $z$ before performing the bounds check will silently map any adversarially crafted $z \ge q_{25519}$ to a value in $[0, q_{25519})$, causing the Ristretto verification equation to accept with a different effective integer than the BLS equation uses, and breaking the cross-curve equality binding.  The bounds check must therefore be the \emph{first} operation performed on the raw bytes:
+  Verify that $0 \le z \le 2^{240}-1$ (as an integer). If not, reject. This tighter bound (compared to checking only $z < q_{25519}$, where $q_{25519} \approx 2^{252}$) is enforced by the prover's rejection-sampling step and is required for the zero-knowledge guarantee: without it, a large $z > 2^{240}-1$ would reveal that $c \cdot m$ is large, leaking a lower bound on the secret $m$.  Only after the bounds check passes should the implementation derive the field-reduced values $z_{\text{BLS}} = z \bmod q_{\text{BLS}}$ and $z_{25519} = z \bmod q_{25519}$ for use in the scalar-multiplication equations below.
 
 \item \textbf{Recompute Challenge:}
   Compute $c$ using the identical length-prefixed encoding as the prover:
@@ -826,13 +837,15 @@ and that $m \in [0, 2^{32}-1]$.
   \]
 
 \item \textbf{Verify BLS12-381 Equation:}
+  Let $z_{\text{BLS,red}} = z \bmod q_{\text{BLS}}$ (derived from the already-bounds-checked integer $z$).
   \[
-  z \cdot h_{\mathsf{val}} + z_{\text{BLS}} \cdot h_0 \stackrel{?}{=} R_{\text{BLS}} + c \cdot C_{\text{BLS}} \quad \text{in } \mathbb{G}_{\text{BLS}}.
+  z_{\text{BLS,red}} \cdot h_{\mathsf{val}} + z_{\text{BLS}} \cdot h_0 \stackrel{?}{=} R_{\text{BLS}} + c \cdot C_{\text{BLS}} \quad \text{in } \mathbb{G}_{\text{BLS}}.
   \]
 
 \item \textbf{Verify Ristretto Equation:}
+  Let $z_{25519,\text{red}} = z \bmod q_{25519}$ (derived from the already-bounds-checked integer $z$; since $z \le 2^{240} < q_{25519}$, this reduction is the identity).
   \[
-  z \cdot G + z_{25519} \cdot H \stackrel{?}{=} R_{25519} + c \cdot C_{25519} \quad \text{in } \mathbb{G}_{25519}.
+  z_{25519,\text{red}} \cdot G + z_{25519} \cdot H \stackrel{?}{=} R_{25519} + c \cdot C_{25519} \quad \text{in } \mathbb{G}_{25519}.
   \]
 
 \item \textbf{Verify Bulletproof:}
@@ -962,6 +975,10 @@ We proceed through a sequence of games $\mathsf{G}_0,\dots,\mathsf{G}_8$. Let $\
 \Pr[\text{Case B win in }\mathsf{G}_7] \le \frac{q_R}{q} + \negl(\lambda).
 \]
 
+\begin{remark}[Ideal-DB assumption and practical partial-write safety]
+The proof of $\mathsf{G}_7$ assumes that $\DB_{\mathsf{epoch}}$ is updated \emph{atomically and instantaneously}: in the ideal model there are no crashes, no network partitions, and no partial writes between the idempotency cache and the nullifier store.  A real implementation must bridge this gap.  The key mechanism is to derive the Refresh idempotency cache key from $N_T$ rather than from the proof transcript $\pi_{\mathsf{refresh}}$ (Section~\ref{sec:idempotency}): because $N_T$ is cryptographically bound to the client's master key and the epoch, an adversary cannot alter it between retries.  Consequently, even if the server crashes after writing the cache entry but before inserting $N_T$ into $\DB_{\mathsf{epoch}}$, any subsequent request carrying the same $N_T$---regardless of any change in $K_{\mathsf{daily}}$ or $r_{\mathsf{daily}}$---will unconditionally hit the cache and return the original response.  The formal bound above is therefore achievable in practice when the implementation obeys the write-ordering invariant described in Section~\ref{sec:idempotency}.
+\end{remark}
+
 \paragraph{Game $\mathsf{G}_8$ (Overspending):} Suppose $\mathcal{A}$ attempts to overspend. Each spend proof includes a BEQ proof that the new balance $m \ge 0$ and Schnorr equalities ensuring $m = c_{\mathsf{bal}} - s$. By induction on the number of spends from a single daily token, the total spent cannot exceed $c_{\mathsf{max}}$. To overspend, $\mathcal{A}$ must either (a) double-spend a token nullifier $k_{\mathsf{cur}}$ (prevented by $\DB_{\mathsf{spend}}$), (b) forge a spend proof (breaks DL), or (c) spend from multiple daily tokens derived from the same master token in the same epoch, which is Case B and already bounded. Thus,
 \[
 \Pr[\text{Case C win in }\mathsf{G}_8] \le \Pr[\text{Case B win}] + \advantage{DL}(\mathcal{B}_4).
@@ -1080,22 +1097,25 @@ H_T = \mathcal{H}_{\mathbb{G}_1}(\text{``EBUT:Epoch:''} \parallel T) \in \mathbb
 The hash function $\mathcal{H}_{\mathbb{G}_1}$ should be instantiated using a standard hash-to-curve method (e.g., RFC 9380) with domain separation tag \texttt{"ACT:Epoch:"}. The epoch $T$ is encoded as a 32-bit \textbf{little-endian} integer (matching the reference implementation's \texttt{t.to\_le\_bytes()} convention). The nullifier is $N_T = k_{\mathsf{sub}} \cdot H_T$. The server \textbf{must not} use a secret-derived base; the trustless nullifier property relies on the public derivation of $H_T$.
 
 \subsection{Idempotency and Torn Transaction Recovery}
+\label{sec:idempotency}
 
 Network failures and client crashes can lead to retried requests. To prevent double-spend errors and improve user experience, the server must implement idempotency caches.
 
 \paragraph{Refresh Phase Idempotency.}
-When the server issues a Daily Token, it computes a cache key using a length-prefixed encoding to prevent byte-shifting collisions:
+When the server issues a Daily Token, it computes a cache key derived from the epoch nullifier $N_T$:
 \[
-\mathtt{key}_{\mathsf{ref}} = \mathcal{H}_{\mathsf{scalar}}\!\left(\text{``EBUT:Idempotency:Refresh''} \parallel \mathsf{len}(\pi_{\mathsf{refresh}}) \parallel \pi_{\mathsf{refresh}} \right),
+\mathtt{key}_{\mathsf{ref}} = \mathcal{H}_{\mathsf{scalar}}\!\left(\text{``EBUT:Idempotency:Refresh''} \parallel N_T \right).
 \]
-where $\mathsf{len}(\cdot)$ denotes a fixed-width (e.g., 4-byte big-endian) encoding of the byte length of the following field. This length-prefix prevents an adversary from shifting bytes between fields to produce the same concatenated input for different payloads.
-The mapping $\mathtt{key}_{\mathsf{ref}} \mapsto (A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$ is stored for the remainder of the epoch (or at least several minutes). If a client resubmits an identical $\pi_{\mathsf{refresh}}$, the server returns the cached response \textbf{without} re-executing the expensive verification (pairings, MSMs) and \textbf{without} re-checking the epoch nullifier in $\DB_{\mathsf{epoch}}$.
+The mapping $\mathtt{key}_{\mathsf{ref}} \mapsto (A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$ is stored for the remainder of the epoch (or at least several minutes). If a client resubmits a request carrying the same epoch nullifier $N_T$ (regardless of whether $K_{\mathsf{daily}}$ or $r_{\mathsf{daily}}$ was regenerated), the server returns the cached response \textbf{without} re-executing the expensive verification (pairings, MSMs) and \textbf{without} re-checking $\DB_{\mathsf{epoch}}$.
+
+\textbf{Why the key must bind $N_T$, not $\pi_{\mathsf{refresh}}$.}
+An earlier design keyed the cache on a hash of $\pi_{\mathsf{refresh}}$ directly.  This is insecure.  The proof $\pi_{\mathsf{refresh}}$ incorporates $K_{\mathsf{daily}}$, which in turn depends on the ephemeral blinding scalar $r_{\mathsf{daily}}$.  An adversarial client is not bound to reuse the same $r_{\mathsf{daily}}$ on a retry.  If the server crashes after writing the cache entry but before inserting $N_T$ into $\DB_{\mathsf{epoch}}$, an adversary can submit a new request with a freshly chosen $r_{\mathsf{daily}}' \neq r_{\mathsf{daily}}$, producing a different $K_{\mathsf{daily}}'$, a different $\pi_{\mathsf{refresh}}'$, and therefore a different cache key.  The new request misses the cache, passes the $\DB_{\mathsf{epoch}}$ freshness check (since the crash left $N_T$ uninserted), and the server issues a \emph{second} distinct daily token for the same epoch---shattering Rate-Limit Soundness.  Keying on $N_T$ closes this window: because $N_T = k_{\mathsf{sub}} \cdot H_T$ depends only on the client's master secret and the public epoch, an adversary cannot alter $N_T$ without forging a new master credential, and any retry with the same $N_T$ unconditionally hits the existing cache entry.
 
 \textbf{Write ordering requirement.}
 The idempotency cache entry \textbf{must} be written \emph{before} inserting $N_T$ into $\DB_{\mathsf{epoch}}$ (see Section~4.3.3, step~11). If the server crashes between the $\DB_{\mathsf{epoch}}$ insertion and the cache write, the client's retry will find $N_T$ already in $\DB_{\mathsf{epoch}}$ but no cache hit, and the server will permanently reject the user for the entire epoch. Writing the cache first eliminates this window: if the server crashes between the cache write and the $\DB_{\mathsf{epoch}}$ insertion, the retry finds a cache hit and returns the correct response without touching $\DB_{\mathsf{epoch}}$. If the idempotency cache and $\DB_{\mathsf{epoch}}$ reside in separate storage systems, these two writes must be wrapped in a single distributed transaction, or the cache must be written first.
 
-\textbf{Crash recovery via deterministic key derivation.}
-Because $k_{\mathsf{daily}}$ and $r_{\mathsf{daily}}$ are derived deterministically (Section~4.3.1), the server's idempotency cache provides \emph{complete} crash recovery.  If the client crashes after the server has processed the refresh but before the response is received, the client re-evaluates the PRF from its stored $k_{\mathsf{sub}}$, reconstructs the identical $\pi_{\mathsf{refresh}}$, and the server's cache returns the cached blind signature.  No ephemeral state need be persisted beyond the long-lived master secret.
+\textbf{Crash recovery via deterministic nullifier derivation.}
+Because $N_T = k_{\mathsf{sub}} \cdot H_T$ is deterministic, the $N_T$-keyed idempotency cache provides \emph{complete} crash recovery for honest clients.  If the client crashes after the server has processed the refresh but before the response is received, the client re-evaluates the PRF from its stored $k_{\mathsf{sub}}$, reconstructs the identical $N_T$, and the server's cache returns the cached blind signature.  No ephemeral state need be persisted beyond the long-lived master secret.  Importantly, even if the honest client re-derives fresh randomness $r_{\mathsf{daily}}'$ (producing a different $K_{\mathsf{daily}}'$ and $\pi_{\mathsf{refresh}}'$), the $N_T$-based cache lookup still hits the original entry and returns the cached daily token.
 
 \paragraph{Spend Phase Idempotency.}
 For spend requests, the cache key must bind the mode tag and every mode-specific public field using the same length-prefixed encoding:
@@ -1104,11 +1124,13 @@ For spend requests, the cache key must bind the mode tag and every mode-specific
 h_{\mathsf{id}} = \mathcal{H}_{\mathsf{scalar}}\!\bigl(&\text{``EBUT:Idempotency:Spend''} \parallel \mathsf{mode} \\
 &\parallel \mathsf{len}(s_{\mathsf{req}}^{\mathsf{enc}}) \parallel s_{\mathsf{req}}^{\mathsf{enc}} \\
 &\parallel \mathsf{len}(C_s^{\mathsf{enc}}) \parallel C_s^{\mathsf{enc}} \\
+&\parallel \mathsf{len}(C_{s-1}^{\mathsf{enc}}) \parallel C_{s-1}^{\mathsf{enc}} \\
 &\parallel \mathsf{len}(\pi_{\text{BEQ\_s}}^{\mathsf{enc}}) \parallel \pi_{\text{BEQ\_s}}^{\mathsf{enc}} \\
+&\parallel \mathsf{len}(\pi_{\text{BEQ\_s\_minus\_1}}^{\mathsf{enc}}) \parallel \pi_{\text{BEQ\_s\_minus\_1}}^{\mathsf{enc}} \\
 &\parallel \mathsf{len}(\pi_{\mathsf{spend}}) \parallel \pi_{\mathsf{spend}} \parallel \eta \bigr).
 \end{aligned}
 \]
-Here $s_{\mathsf{req}}^{\mathsf{enc}}$ is the 4-byte encoding of $s_{\mathsf{req}}$ in Exact mode and the empty string in Hidden mode; conversely $C_s^{\mathsf{enc}}$ and $\pi_{\text{BEQ\_s}}^{\mathsf{enc}}$ are populated only in Hidden mode and encoded as the empty string in Exact mode. The fixed length of $\eta$ (16 bytes) eliminates ambiguity on that side; the length prefix on every optional field prevents byte-shifting and cross-mode malleability. Raw concatenation that omits the mode tag or omits the empty-field markers is \textbf{prohibited}: otherwise a relay can rewrite an Exact request as Hidden (or vice versa) while preserving the cache key. The server stores $h_{\mathsf{id}} \mapsto (A^*, e^*, s'^*)$ for the duration of the epoch plus the grace period---the same TTL assigned to the corresponding $k_{\mathsf{cur}}$ entry in $\DB_{\mathsf{spend}}$. \textbf{This TTL must exactly match or exceed the TTL of the token nullifier.} If the idempotency cache entry expires before $k_{\mathsf{cur}}$ expires in $\DB_{\mathsf{spend}}$, a client whose network dropped after the server committed the transaction but before the client received the response will later retry, find no cache hit, reach the double-spend check, and be permanently rejected with a 409 Conflict---losing their token with no recourse. \textbf{Crucially, the idempotency cache must be checked \emph{before} the double-spend database}, and must be \emph{written before} $\DB_{\mathsf{spend}}$ is mutated (see the exact spend flow and the Hidden-mode variant above). If a match is found, the cached refund token is returned immediately. This prevents legitimate retries from being incorrectly flagged as double spends. If the cache and the double-spend database reside in separate storage systems, these two writes must be wrapped in a single distributed transaction, or the cache must be written first.
+Here $s_{\mathsf{req}}^{\mathsf{enc}}$ is the 4-byte encoding of $s_{\mathsf{req}}$ in Exact mode and the empty string in Hidden mode; conversely $C_s^{\mathsf{enc}}$, $C_{s-1}^{\mathsf{enc}}$, $\pi_{\text{BEQ\_s}}^{\mathsf{enc}}$, and $\pi_{\text{BEQ\_s\_minus\_1}}^{\mathsf{enc}}$ are populated only in Hidden mode and encoded as the empty string in Exact mode. The fixed length of $\eta$ (16 bytes) eliminates ambiguity on that side; the length prefix on every optional field prevents byte-shifting and cross-mode malleability. Raw concatenation that omits the mode tag or omits the empty-field markers is \textbf{prohibited}: otherwise a relay can rewrite an Exact request as Hidden (or vice versa) while preserving the cache key. The server stores $h_{\mathsf{id}} \mapsto (A^*, e^*, s'^*)$ for the duration of the epoch plus the grace period---the same TTL assigned to the corresponding $k_{\mathsf{cur}}$ entry in $\DB_{\mathsf{spend}}$. \textbf{This TTL must exactly match or exceed the TTL of the token nullifier.} If the idempotency cache entry expires before $k_{\mathsf{cur}}$ expires in $\DB_{\mathsf{spend}}$, a client whose network dropped after the server committed the transaction but before the client received the response will later retry, find no cache hit, reach the double-spend check, and be permanently rejected with a 409 Conflict---losing their token with no recourse. \textbf{Crucially, the idempotency cache must be checked \emph{before} the double-spend database}, and must be \emph{written before} $\DB_{\mathsf{spend}}$ is mutated (see the exact spend flow and the Hidden-mode variant above). If a match is found, the cached refund token is returned immediately. This prevents legitimate retries from being incorrectly flagged as double spends. If the cache and the double-spend database reside in separate storage systems, these two writes must be wrapped in a single distributed transaction, or the cache must be written first.
 
 \subsection{API Payload Specification}
 
@@ -1191,7 +1213,9 @@ Hidden mode:
   "K_prime": <48-byte compressed G1 point, hex>,
   "C_BP": <48-byte compressed G1 point, hex>,
   "C_s": <48-byte compressed G1 point, hex>,
+  "C_s_minus_1": <48-byte compressed G1 point, hex>,
   "pi_BEQ_s": <binary blob, base64 or hex>,
+  "pi_BEQ_s_minus_1": <binary blob, base64 or hex>,
   "pi_spend": {
     "A_prime": <48-byte compressed G1 point, hex>,
     "A_bar": <48-byte compressed G1 point, hex>,
@@ -1221,6 +1245,7 @@ Hidden mode:
 \begin{itemize}[leftmargin=*]
 \item \textbf{Group Elements:} All $\mathbb{G}_1$ elements must be serialized in \textbf{compressed} form (48 bytes for BLS12-381). Deserialization must validate that the point lies in the prime-order subgroup ($q \cdot P = 1_{\mathbb{G}_1}$) and is canonically encoded.
 \item \textbf{Scalars:} All scalars must be serialized as \textbf{fixed-width 32-byte big-endian} integers. During deserialization, any 32-byte scalar $x$ must be rejected if $x \ge q$ (the group order). This prevents scalar malleability attacks.
+\item \textbf{BEQ cross-curve integer $z$:} The BEQ response value $z$ is \textbf{not} a curve scalar; it is a plain unsigned integer in $[0, 2^{240}-1]$ and must be serialized as a \textbf{fixed-width 31-byte big-endian} unsigned integer.  \textbf{Implementations must deserialize $z$ as a raw integer and perform the bounds check $0 \le z \le 2^{240}-1$ before any other operation.}  Under no circumstances should $z$ be passed to a curve-scalar deserialization routine (e.g., \texttt{Scalar::from\_bytes\_mod\_order}) before this check: doing so silently applies modular reduction and will accept a maliciously crafted $z \ge q_{25519}$ that breaks the cross-curve binding (see the Verifier Bound Check in Section~\ref{sec:crosscurve} and Critical Component C2).
 \item \textbf{Domain Separation:} All hash function invocations must include a domain separation label. In the reference implementation, the generator DST is \texttt{"ACT:BBS:"}, the epoch base-point DST is \texttt{"ACT:Epoch:"}, the BEQ challenge domain is \texttt{"ACT:BEQ:Challenge"}, and the Fiat--Shamir labels are \texttt{b"Refresh"} and \texttt{b"Spend"} respectively. Any interoperable implementation must use these exact strings. The context hash $H_{\mathsf{ctx}}$ (Section~4.1.1) must be included as the first element in every Fiat--Shamir challenge to bind all proofs to the deployment.
 \item \textbf{Fiat--Shamir Hash Width:} For the BLS12-381 scalar field ($q$ a 255-bit prime), the bias introduced by reducing a 32-byte SHA-256 digest modulo $q$ is $(2^{256} \bmod q)/q \approx 2^{-255}$, which is negligible at the 128-bit security level. The reference implementation uses SHA-256 with repeated-subtraction mod-$q$ reduction and is cryptographically sound. For conservative interoperability or when targeting fields with smaller orders, use SHA-512 (64-byte output) before reduction.
 \item \textbf{Subgroup Checks:} Every received $\mathbb{G}_1$ element must be validated to lie in the prime-order subgroup to prevent small-subgroup attacks.
@@ -1346,14 +1371,13 @@ presentation in earlier sections.
   \texttt{scalar\_from\_le\_bytes\_mod\_order} and
   \texttt{DalekScalar::from\_bytes\_mod\_order} on the identical byte array.
 
-\item \textbf{Bounds check $z_e < q_{25519}$ on the verifier side.}
-  The verifier must reject any $z_e \ge q_{25519}$ before proceeding.  An
-  adversary who transmits $z_e \ge q_{25519}$ forces $z_m^{25519}$ to wrap
-  modulo $q_{25519}$, making the Ristretto equation verify with a different
+\item \textbf{Bounds check $z_e < 2^{240}$ on the verifier side, performed on the raw integer before any scalar operation.}
+  The verifier must reject any $z_e \ge 2^{240}$ \emph{and} must perform this check on the raw deserialized integer---not on a value that has already been passed through a curve-scalar routine.  An
+  adversary who transmits $z_e \ge q_{25519}$ but less than $2^{241}$ will find that a Ristretto scalar library silently reduces $z_e$ modulo $q_{25519}$, making the Ristretto equation verify with a different
   effective integer than the BLS equation checks, breaking the
   cross-curve equality binding.  The check is strictly tighter than
   $z_e < 2^{256}$ because $q_{25519} \approx 2^{252}$ while $q_{\text{BLS}}
-  \approx 2^{255}$.
+  \approx 2^{255}$.  Concretely: parse $z_e$ as a 31-byte big-endian unsigned integer, assert $z_e \le 2^{240}-1$, and only then derive $z_m^{\text{BLS}} = z_e \bmod q_{\text{BLS}}$ and $z_m^{25519} = z_e \bmod q_{25519}$ by calling \texttt{scalar\_from\_le\_bytes\_mod\_order} and \texttt{DalekScalar::from\_bytes\_mod\_order} on the raw bytes.
 
 \item \textbf{240-bit blinding factor $u_m$ for BEQ statistical zero-knowledge.}
   The blinder $u_m$ must be drawn uniformly from $[0, 2^{240}-1]$.  The
@@ -1394,7 +1418,7 @@ presentation in earlier sections.
   permanently while aborting during proof verification, locking out the
   legitimate owner for the remainder of the epoch.
 
-\item \textbf{Write ordering: idempotency cache written before nullifier insertion.}
+\item \textbf{Write ordering: idempotency cache written before nullifier insertion; cache key must bind $N_T$.}
   If the server crashes after inserting $N_T$ into $\DB_{\mathsf{epoch}}$ but
   before writing the cached daily-token response, the client's retry finds no
   cache hit, hits the nullifier check, and is permanently locked out.
@@ -1404,8 +1428,10 @@ presentation in earlier sections.
   engineering preference: its violation causes an honest user to lose access
   without any cryptographic fault on their part.
 
-\item \textbf{Deterministic derivation of $k_{\mathsf{daily}}$ and $r_{\mathsf{daily}}$ guarantees crash recovery.}
-  Because $k_{\mathsf{daily}}$ and $r_{\mathsf{daily}}$ are derived deterministically from the persisted master secret $k_{\mathsf{sub}}$ and the public epoch $T$ via the PRF (Section~4.3.1), a client that reboots after the server has processed the refresh but before the response arrived can re-evaluate the same PRF outputs from $k_{\mathsf{sub}}$ alone and reconstruct the identical $K_{\mathsf{daily}}$ and $\pi_{\mathsf{refresh}}$.  The server's idempotency cache matches the resubmitted proof hash and returns the cached blind signature, which the client correctly unblinds.  No synchronous on-device write of ephemeral randomness is required before the network request: the only secret that must be durably stored is the long-lived $k_{\mathsf{sub}}$, which is already a baseline requirement for any resumable subscription.
+  Furthermore, the idempotency cache key \textbf{must} be derived from the epoch nullifier $N_T$ (Section~\ref{sec:idempotency}) and not from $\pi_{\mathsf{refresh}}$ or $K_{\mathsf{daily}}$ alone.  The latter values incorporate the ephemeral blinding scalar $r_{\mathsf{daily}}$, which an adversarial client may re-sample between retries.  If the cache key were proof-based, an adversary who detects a crash (via timeout) could submit a second request with fresh randomness, producing a different cache key, missing the earlier entry, and---because $N_T$ was never inserted during the crash---obtaining a second distinct daily token for the same epoch.  An $N_T$-keyed cache closes this gap: the adversary cannot alter $N_T$ without forging a new master credential, so any request with the same $N_T$ necessarily hits the existing entry and receives the already-issued response.
+
+\item \textbf{Deterministic derivation of $k_{\mathsf{daily}}$ and $r_{\mathsf{daily}}$ supports crash recovery; cache is keyed on $N_T$.}
+  Because $k_{\mathsf{daily}}$ and $r_{\mathsf{daily}}$ are derived deterministically from the persisted master secret $k_{\mathsf{sub}}$ and the public epoch $T$ via the PRF (Section~4.3.1), a client that reboots after the server has processed the refresh but before the response arrived can re-evaluate the same PRF outputs from $k_{\mathsf{sub}}$ alone and reconstruct the identical $K_{\mathsf{daily}}$ and $\pi_{\mathsf{refresh}}$.  The server's idempotency cache, keyed on $N_T = k_{\mathsf{sub}} \cdot H_T$ (Section~\ref{sec:idempotency}), matches the resubmitted nullifier and returns the cached blind signature, which the client correctly unblinds.  No synchronous on-device write of ephemeral randomness is required before the network request: the only secret that must be durably stored is the long-lived $k_{\mathsf{sub}}$, which is already a baseline requirement for any resumable subscription.  Implementations that key the cache on $\pi_{\mathsf{refresh}}$ rather than $N_T$ are vulnerable to the double-mint attack described in Section~\ref{sec:idempotency} and must be updated.
 
 \item \textbf{BEQ Bulletproof transcript binds BBS+ and bridge commitments.}
   The Merlin transcript for the Dalek range proof must be initialised with the
